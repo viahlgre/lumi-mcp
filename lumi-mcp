@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+"""lumi-mcp -- a stdio MCP server for a LUMI project directory.
+
+The server runs on the LUMI login node and keeps one persistent
+Apptainer/Singularity *instance* per project directory. Every shell
+command is executed by joining that instance, so the command sees the
+project directory and a project-local fake HOME, and nothing else from
+the host filesystem.
+
+Two launch modes, same server:
+
+    # harness running on LUMI
+    /users/x/lumi-mcp --project scaling_1
+
+    # harness elsewhere; stdio is carried over ssh
+    ssh -T lumi.csc.fi '/users/x/lumi-mcp --project scaling_1'
+
+Protocol: newline-delimited JSON-RPC 2.0 on stdin/stdout. Nothing else
+may be written to stdout -- logs go to stderr.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+SERVER_NAME = "lumi-mcp"
+SERVER_VERSION = "0.1.0"
+PROTOCOL_FALLBACK = "2024-11-05"
+PROTOCOL_KNOWN = {
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+}
+
+DEFAULT_CONFIG = Path.home() / ".lumi-mcp" / "config.yaml"
+STATE_DIR = Path(os.environ.get("LUMI_MCP_STATE", Path.home() / ".lumi-mcp"))
+
+MAX_OUTPUT_BYTES = 64 * 1024
+DEFAULT_TIMEOUT_S = 120
+MAX_TIMEOUT_S = 900
+
+# Flags applied at `instance start`. These are the containment contract and
+# they are part of the instance identity, so changing this list yields new
+# instance names rather than silently reusing containers with old mounts.
+#
+# Verified against Apptainer 1.5.5:
+#   - the instance NAME is a positional argument, not --name
+#   - `--no-start` does not exist; PID 1 is Apptainer's own `appinit`, so an
+#     image startscript may run briefly but nothing has to stay alive
+#   - `--contain` alone already gives an empty, writable $HOME
+#   - unknown `--no-mount` values are IGNORED with a warning, not rejected,
+#     so the value has to be one that really exists: 'bind-paths' is the
+#     name that disables the `bind path =` entries from apptainer.conf
+#   - a bind destination must be absolute: `-B dir:~` fails, `-B dir:/path`
+#     or `-H dir:/path` works, and -H also sets $HOME
+#   - flags given to `exec` after the instance URI are treated as the
+#     command, and mount flags before it are silently ignored, so exec
+#     cannot add mounts to a running instance
+BASE_START_FLAGS = ["--no-home", "--contain", "--cleanenv"]
+OPTIONAL_START_FLAGS = ["--no-mount=bind-paths"]
+
+# TODO(slurm): `sbatch` inside the image is defence in depth only. The real
+# boundary is that /run/munge is not mounted, so nothing inside can sign a
+# request to slurmctld. Assert both at startup (see probe_containment).
+
+
+def log(msg: str) -> None:
+    print(f"[lumi-mcp] {msg}", file=sys.stderr, flush=True)
+
+
+class ConfigError(Exception):
+    pass
+
+
+class ToolError(Exception):
+    """A failure that belongs to the tool call, not to the protocol."""
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Project:
+    alias: str
+    description: str
+    directory: Path
+    image: Path
+    account: str
+    partition: str
+    home: Path
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Config:
+    path: Path
+    command: str
+    projects: list[Project]
+
+    def by_alias(self, alias: str) -> Project:
+        for p in self.projects:
+            if p.alias == alias:
+                return p
+        known = ", ".join(p.alias for p in self.projects) or "<none>"
+        raise ConfigError(f"no project named {alias!r} in {self.path} (known: {known})")
+
+
+def _as_env(raw: Any, where: str) -> dict[str, str]:
+    """Accept either a plain map or a list of one-key maps."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    if isinstance(raw, list):
+        out: dict[str, str] = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ConfigError(f"{where}.env: expected a mapping, got {type(item).__name__}")
+            for k, v in item.items():
+                out[str(k)] = str(v)
+        return out
+    raise ConfigError(f"{where}.env: expected a mapping or a list of mappings")
+
+
+def load_config(path: Path) -> Config:
+    try:
+        raw = yaml.safe_load(path.read_text())
+    except FileNotFoundError:
+        raise ConfigError(f"config not found: {path}") from None
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path}: {exc}") from None
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path}: top level must be a mapping")
+
+    general = raw.get("general") or {}
+    if not isinstance(general, dict):
+        raise ConfigError(f"{path}: 'general' must be a mapping")
+    command = str(general.get("command") or "").strip()
+    if not command:
+        raise ConfigError(f"{path}: general.command is required (e.g. /usr/bin/apptainer)")
+
+    entries = raw.get("projects")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(f"{path}: 'projects' must be a non-empty list")
+
+    projects: list[Project] = []
+    seen: set[str] = set()
+    for idx, entry in enumerate(entries):
+        where = f"projects[{idx}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"{where}: must be a mapping")
+        alias = str(entry.get("alias") or "").strip()
+        if not alias:
+            raise ConfigError(f"{where}: alias is required")
+        if not all(c.isalnum() or c in "_.-" for c in alias):
+            raise ConfigError(f"{where}: alias {alias!r} may only contain letters, digits, '_', '.', '-'")
+        if alias in seen:
+            raise ConfigError(f"{where}: duplicate alias {alias!r}")
+        seen.add(alias)
+
+        def need(key: str) -> str:
+            val = entry.get(key)
+            if val is None or str(val).strip() == "":
+                raise ConfigError(f"{where} ({alias}): {key} is required")
+            return str(val).strip()
+
+        directory = Path(need("directory")).expanduser()
+        image = Path(need("image")).expanduser()
+        home = Path(need("home")).expanduser()
+        for name, p in (("directory", directory), ("image", image), ("home", home)):
+            if not p.is_absolute():
+                raise ConfigError(f"{where} ({alias}): {name} must be an absolute path")
+        # `home` is bound over the real $HOME inside the container. Pointing it
+        # at the real home would put ssh keys and dotfiles back inside, which
+        # defeats the point of the fake home.
+        if Path(os.path.abspath(home)) == Path(os.path.abspath(host_home())):
+            raise ConfigError(
+                f"{where} ({alias}): home must not be the real $HOME ({host_home()}); "
+                "give the container its own throwaway directory"
+            )
+        if Path(os.path.abspath(home)) == Path(os.path.abspath(directory)):
+            raise ConfigError(f"{where} ({alias}): home and directory must differ")
+
+        projects.append(
+            Project(
+                alias=alias,
+                description=str(entry.get("description") or ""),
+                directory=directory,
+                image=image,
+                account=need("account"),
+                partition=need("partition"),
+                home=home,
+                env=_as_env(entry.get("env"), where),
+            )
+        )
+
+    return Config(path=path, command=command, projects=projects)
+
+
+def path_is_under(child: Path, parent: Path) -> bool:
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def host_home() -> Path:
+    """The real home directory of the user running the server.
+
+    A project's `home` is bound over this path inside the container, so the
+    path stays the same but the contents are the throwaway one. Configuring a
+    project whose `home` *is* the real home would put ssh keys and dotfiles
+    back inside the container, and is refused at startup.
+    """
+    return Path.home()
+
+
+def select_project(config: Config, alias: str | None, cwd: Path) -> Project:
+    if alias:
+        return config.by_alias(alias)
+
+    # Running in situ: pick the project that contains the working directory.
+    # Component-wise comparison, so /a/b never matches /a/bc.
+    real_cwd = cwd.resolve()
+    matches = [
+        p for p in config.projects if path_is_under(real_cwd, p.directory.resolve())
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # deepest directory wins
+        return max(matches, key=lambda p: len(p.directory.resolve().parts))
+
+    if len(config.projects) == 1:
+        return config.projects[0]
+
+    aliases = ", ".join(p.alias for p in config.projects)
+    raise ConfigError(
+        f"cannot choose a project: {real_cwd} is not inside any configured project "
+        f"and --project was not given (known: {aliases})"
+    )
+
+
+# --------------------------------------------------------------------------
+# instance lifecycle
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Flags:
+    """Runtime capabilities, probed once."""
+
+    no_start: bool
+    no_mount_library: bool
+
+    def start_flags(self) -> list[str]:
+        flags = list(BASE_START_FLAGS)
+        if self.no_mount_library:
+            flags.extend(OPTIONAL_START_FLAGS)
+        return flags
+
+
+def image_stamp(image: Path) -> dict[str, Any]:
+    """Cheap identity for the image.
+
+    A real sha256 of a multi-GB SIF over Lustre costs minutes at startup;
+    mtime+size is instant and still changes when the image is rebuilt.
+    """
+    try:
+        st = image.stat()
+    except OSError:
+        return {"path": str(image), "missing": True}
+    return {"path": str(image), "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+class Runtime:
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self._flags: Flags | None = None
+
+    def _help(self, *args: str) -> str:
+        try:
+            proc = subprocess.run(
+                [self.command, *args, "--help"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return (proc.stdout + proc.stderr).decode("utf-8", "replace")
+
+    def flags(self) -> Flags:
+        if self._flags is None:
+            start_help = self._help("instance", "start")
+            self._flags = Flags(
+                no_start="--no-start" in start_help,
+                no_mount_library="--no-mount" in start_help,
+            )
+            log(
+                f"runtime {self.command}: --no-start={self._flags.no_start} "
+                f"--no-mount={self._flags.no_mount_library}"
+            )
+        return self._flags
+
+    def start_flags(self) -> list[str]:
+        return self.flags().start_flags()
+
+    def run(self, argv: list[str], timeout: float = 120) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def instance_start(self, name: str, project: Project) -> None:
+        """Start the instance: apptainer instance start [flags] IMAGE NAME.
+
+        There is no `--name` flag; the image and the instance name are the
+        two positional arguments, in that order.
+        """
+        argv = [self.command, "instance", "start"]
+        if self.flags().no_start:
+            argv.append("--no-start")
+        argv.extend(self.start_flags())
+        argv.extend(["-B", f"{project.directory}:{project.directory}"])
+        # Bind destination must be absolute, and `~` is not accepted. Using the
+        # host $HOME as the destination keeps paths identical inside and out
+        # while the contents are the project's throwaway home.
+        argv.extend(["-B", f"{project.home}:{host_home()}"])
+        argv.extend([str(project.image), name])
+
+        log("starting instance: " + " ".join(shlex.quote(a) for a in argv))
+        try:
+            proc = self.run(argv, timeout=900)
+        except FileNotFoundError:
+            raise ToolError(
+                f"cannot run {self.command!r}: no such file (check general.command in the config)"
+            ) from None
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ToolError(f"instance start failed: {exc}") from None
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+            raise ToolError(f"instance start failed (exit {proc.returncode}): {err}")
+
+    def probe_containment(self, name: str, project: Project) -> dict[str, Any]:
+        """Assert the containment instead of believing the flags.
+
+        Apptainer silently ignores unknown `--no-mount` values, so a typo in
+        the flag list degrades to no containment at all. These checks run once
+        after the instance starts and their result is recorded and reported by
+        `status`.
+        """
+        script = "; ".join(
+            [
+                f"test -d {shlex.quote(str(project.directory))} && echo project=ok || echo project=missing",
+                f"test -w {shlex.quote(str(project.directory))} && echo project_rw=yes || echo project_rw=no",
+                "test -S /run/munge/munge.socket.2 && echo munge=visible || echo munge=absent",
+                "command -v sbatch >/dev/null 2>&1 && echo sbatch=present || echo sbatch=absent",
+                f"test -e {shlex.quote(str(host_home()))}/.ssh && echo host_home=visible || echo host_home=hidden",
+            ]
+        )
+        try:
+            proc = self.run(
+                [self.command, "exec", f"instance://{name}", "/bin/sh", "-c", script],
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"error": str(exc)}
+        out = (proc.stdout or b"").decode("utf-8", "replace")
+        findings = dict(
+            line.split("=", 1) for line in out.splitlines() if "=" in line
+        )
+        for key, expected, level in (
+            ("project", "ok", "error"),
+            ("project_rw", "yes", "error"),
+            ("munge", "absent", "warn"),
+            ("host_home", "hidden", "warn"),
+        ):
+            if findings.get(key) != expected:
+                log(f"containment {level}: {key}={findings.get(key)!r} (expected {expected!r})")
+        if findings.get("sbatch") == "present":
+            log("containment note: sbatch is visible inside the container")
+        return findings
+
+    def instance_alive(self, name: str) -> bool:
+        try:
+            proc = self.run([self.command, "exec", f"instance://{name}", "/bin/true"], timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    def instance_stop(self, name: str) -> None:
+        log(f"stopping instance {name}")
+        try:
+            self.run([self.command, "instance", "stop", name], timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"instance stop failed: {exc}")
+
+    def exec_script(self, name: str, script: str) -> list[str]:
+        return [self.command, "exec", f"instance://{name}", "/bin/sh", "-c", script]
+
+
+def instance_name(project: Project, runtime: Runtime) -> str:
+    """Deterministic name over everything that defines the containment.
+
+    account / partition / env are deliberately excluded: they are policy,
+    not containment, so changing them must not create a new container.
+    """
+    payload = {
+        "directory": str(project.directory.resolve()),
+        "home": str(project.home.resolve()),
+        "image": image_stamp(project.image),
+        "runtime": runtime.command,
+        "flags": runtime.start_flags(),
+    }
+    blob = json.dumps(payload, sort_keys=True).encode()
+    return "lumi-mcp-" + hashlib.sha256(blob).hexdigest()[:12]
+
+
+@contextmanager
+def locked(path: Path, timeout: float = 120.0):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ToolError(f"timed out waiting for lock {path}") from None
+                time.sleep(0.1)
+        yield
+    finally:
+        os.close(fd)
+
+
+class Instance:
+    """One container per project directory, reused across calls and restarts."""
+
+    def __init__(self, runtime: Runtime, project: Project) -> None:
+        self.runtime = runtime
+        self.project = project
+        self.name = instance_name(project, runtime)
+        self.record_path = STATE_DIR / "instances" / f"{self.name}.json"
+        self.lock_path = STATE_DIR / "locks" / f"{self.name}.lock"
+
+    # -- record ------------------------------------------------------------
+
+    def read_record(self) -> dict[str, Any] | None:
+        try:
+            return json.loads(self.record_path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def write_record(
+        self,
+        *,
+        created: bool,
+        previous: dict[str, Any] | None = None,
+        probe: dict[str, Any] | None = None,
+    ) -> None:
+        now = time.time()
+        record = {
+            "name": self.name,
+            "alias": self.project.alias,
+            "directory": str(self.project.directory),
+            "image": str(self.project.image),
+            "home": str(self.project.home),
+            "runtime": self.runtime.command,
+            "flags": self.runtime.start_flags(),
+            "host": socket.gethostname(),
+            "started_at": previous.get("started_at") if previous else now,
+            "last_used": now,
+            "started_by_us": (previous or {}).get("started_by_us", True) if previous else True,
+            "probe": probe,
+        }
+        if created:
+            record["started_at"] = now
+        self.record_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.record_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(record, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        tmp.replace(self.record_path)
+
+    def touch(self) -> None:
+        record = self.read_record()
+        if record:
+            record["last_used"] = time.time()
+            try:
+                self.record_path.write_text(json.dumps(record, indent=2) + "\n")
+            except OSError:
+                pass
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def ensure(self) -> tuple[dict[str, Any], bool]:
+        """Return (record, created). Starts the instance if it is not alive."""
+        with locked(self.lock_path):
+            existing = self.read_record()
+            if existing:
+                if self.runtime.instance_alive(self.name):
+                    self.touch()
+                    return self.read_record() or existing, False
+                log(f"instance {self.name} has a record but is not alive; recycling")
+                self.runtime.instance_stop(self.name)
+                try:
+                    self.record_path.unlink()
+                except OSError:
+                    pass
+
+            for path, kind in ((self.project.image, "image"), (self.project.directory, "directory")):
+                if not path.exists():
+                    raise ToolError(f"project {self.project.alias}: {kind} does not exist: {path}")
+            if self.project.home.exists():
+                if not self.project.home.is_dir():
+                    raise ToolError(f"project {self.project.alias}: home is not a directory: {self.project.home}")
+            else:
+                self.project.home.mkdir(parents=True, exist_ok=True)
+            os.chmod(self.project.home, 0o700)
+
+            self.runtime.instance_start(self.name, self.project)
+            probe = self.runtime.probe_containment(self.name, self.project)
+            if probe.get("project") != "ok" or probe.get("project_rw") != "yes":
+                # The project must be visible and writable or nothing else
+                # matters; do not hand out an instance that cannot do its job.
+                self.runtime.instance_stop(self.name)
+                raise ToolError(
+                    f"containment probe failed for project {self.project.alias}: {probe}"
+                )
+            self.write_record(created=True, probe=probe)
+            return self.read_record() or {}, True
+
+    def stop(self) -> None:
+        self.runtime.instance_stop(self.name)
+        try:
+            self.record_path.unlink()
+        except OSError:
+            pass
+
+    def is_alive(self) -> bool:
+        return self.runtime.instance_alive(self.name)
+
+
+# --------------------------------------------------------------------------
+# command execution
+# --------------------------------------------------------------------------
+
+
+def resolve_cwd(project: Project, cwd: str | None) -> Path:
+    root = project.directory.resolve()
+    if not cwd:
+        return root
+    target = Path(cwd)
+    if not target.is_absolute():
+        target = root / target
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        raise ToolError(f"cannot resolve cwd: {exc}") from None
+    if not path_is_under(resolved, root):
+        raise ToolError(f"cwd {resolved} is outside the project directory {root}")
+    return resolved
+
+
+def truncate(data: bytes, limit: int = MAX_OUTPUT_BYTES) -> str:
+    text = data[:limit].decode("utf-8", "replace")
+    dropped = len(data) - limit
+    if dropped > 0:
+        text += f"\n[... {dropped} bytes truncated]"
+    return text
+
+
+def kill_group(pid: int) -> None:
+    for sig, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.05)
+
+
+def build_script(project: Project, cwd: Path, command: str) -> str:
+    lines = [f"cd {shlex.quote(str(cwd))}"]
+    for key, value in project.env.items():
+        lines.append(f"export {key}={shlex.quote(value)}")
+    lines.append(command)
+    return "\n".join(lines)
+
+
+def run_in_instance(
+    runtime: Runtime, name: str, script: str, timeout_s: float
+) -> tuple[int, bytes, bytes, bool, float]:
+    """Run a script by joining the instance.
+
+    NOTE: on timeout we kill the host-side client's process group. That does
+    not reliably kill processes started inside the container -- real
+    cancellation needs the container-side process group (future work).
+    """
+    argv = runtime.exec_script(name, script)
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        kill_group(proc.pid)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+    return proc.returncode or 0, out or b"", err or b"", timed_out, time.monotonic() - started
+
+
+# --------------------------------------------------------------------------
+# server state and tools
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Server:
+    config: Config
+    project: Project
+    runtime: Runtime
+    instance: Instance
+
+
+def tool_shell(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
+    command = args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ToolError("command must be a non-empty string")
+
+    cwd = resolve_cwd(server.project, args.get("cwd"))
+
+    raw_timeout = args.get("timeout_s", DEFAULT_TIMEOUT_S)
+    try:
+        timeout_s = float(raw_timeout)
+    except (TypeError, ValueError):
+        raise ToolError("timeout_s must be a number") from None
+    timeout_s = max(1.0, min(timeout_s, MAX_TIMEOUT_S))
+
+    record, created = server.instance.ensure()
+    script = build_script(server.project, cwd, command)
+    rc, out, err, timed_out, duration = run_in_instance(
+        server.runtime, server.instance.name, script, timeout_s
+    )
+    server.instance.touch()
+
+    chunks = [f"exit_code: {rc}", f"duration_ms: {int(duration * 1000)}"]
+    if created:
+        chunks.append(f"instance: started {server.instance.name}")
+    if timed_out:
+        chunks.append(f"timed_out: true (after {timeout_s:g}s)")
+    if out:
+        chunks.append("--- stdout ---\n" + truncate(out).rstrip("\n"))
+    if err:
+        chunks.append("--- stderr ---\n" + truncate(err).rstrip("\n"))
+    text = "\n".join(chunks)
+
+    if timed_out:
+        return text + (
+            "\n\nNOTE: the timeout killed the host-side apptainer client. "
+            "Processes started inside the container may still be running."
+        ), True
+    return text, rc != 0
+
+
+def tool_status(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
+    record = server.instance.read_record()
+    alive = server.instance.is_alive()
+    info = {
+        "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
+        "host": socket.gethostname(),
+        "uid": os.getuid(),
+        "config": str(server.config.path),
+        "state_dir": str(STATE_DIR),
+        "runtime": {
+            "command": server.runtime.command,
+            "start_flags": server.runtime.start_flags(),
+        },
+        "project": {
+            "alias": server.project.alias,
+            "description": server.project.description,
+            "directory": str(server.project.directory),
+            "home": str(server.project.home),
+            "image": str(server.project.image),
+            "account": server.project.account,
+            "partition": server.project.partition,
+            "env": server.project.env,
+        },
+        "instance": {
+            "name": server.instance.name,
+            "alive": alive,
+            "record": record,
+        },
+        "limits": {
+            "default_timeout_s": DEFAULT_TIMEOUT_S,
+            "max_timeout_s": MAX_TIMEOUT_S,
+            "max_output_bytes": MAX_OUTPUT_BYTES,
+        },
+    }
+    return json.dumps(info, indent=2), False
+
+
+TOOLS = [
+    {
+        "name": "shell",
+        "description": (
+            "Run a shell command inside the project container. The command runs in a "
+            "persistent Apptainer/Singularity instance where only the project directory "
+            "is writable; paths are identical inside and outside the container. "
+            "Background processes survive between calls and will be visible to later "
+            "calls. Output is captured and truncated at 64 KiB per stream."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run (executed with /bin/sh -c).",
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": (
+                        "Working directory, absolute or relative to the project root. "
+                        "Must resolve inside the project. Defaults to the project root."
+                    ),
+                },
+                "timeout_s": {
+                    "type": "number",
+                    "description": f"Seconds before the command is killed (default {DEFAULT_TIMEOUT_S}, max {MAX_TIMEOUT_S}).",
+                },
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "status",
+        "description": (
+            "Report the resolved configuration: project alias and paths, container "
+            "runtime and containment flags, instance name and liveness, and active "
+            "limits. Use it to orient yourself before the first command."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+INSTRUCTIONS = (
+    "lumi-mcp runs shell commands for {alias} ({directory}) on {host} inside a "
+    "persistent Apptainer/Singularity instance. Filesystem paths are the same "
+    "inside and outside the container, so paths returned by tools can be used "
+    "verbatim. Only the project directory and a private HOME are writable; the "
+    "rest of the host filesystem is not mounted. The instance keeps running "
+    "between calls, so background processes and their PIDs persist -- use "
+    "`shell` with ps/kill to manage them. Long or parallel work belongs on "
+    "compute nodes via Slurm, which this server does not yet expose."
+)
+
+
+def handle_tools_call(server: Server, params: dict[str, Any]) -> dict[str, Any]:
+    name = params.get("name")
+    args = params.get("arguments") or {}
+    if not isinstance(args, dict):
+        return _text_result("arguments must be an object", is_error=True)
+
+    handlers = {"shell": tool_shell, "status": tool_status}
+    handler = handlers.get(name)
+    if handler is None:
+        return _text_result(f"unknown tool: {name!r}", is_error=True)
+
+    try:
+        text, is_error = handler(server, args)
+    except ToolError as exc:
+        return _text_result(str(exc), is_error=True)
+    except Exception as exc:  # noqa: BLE001 - surface, don't crash the server
+        log("tool crashed:\n" + traceback.format_exc())
+        return _text_result(f"internal error: {exc}", is_error=True)
+    return _text_result(text, is_error=is_error)
+
+
+def _text_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {"content": [{"type": "text", "text": text}]}
+    if is_error:
+        result["isError"] = True
+    return result
+
+
+# --------------------------------------------------------------------------
+# JSON-RPC over stdio
+# --------------------------------------------------------------------------
+
+
+def send(message: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def error_response(msg_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
+
+
+def handle(server: Server, msg: dict[str, Any]) -> dict[str, Any] | None:
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    params = msg.get("params") or {}
+
+    # notifications carry no id and get no response
+    if msg_id is None:
+        return None
+
+    if method == "initialize":
+        requested = params.get("protocolVersion")
+        version = requested if requested in PROTOCOL_KNOWN else PROTOCOL_FALLBACK
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                "instructions": INSTRUCTIONS.format(
+                    alias=server.project.alias,
+                    directory=server.project.directory,
+                    host=socket.gethostname(),
+                ),
+            },
+        }
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        if not isinstance(params, dict):
+            return error_response(msg_id, -32602, "params must be an object")
+        return {"jsonrpc": "2.0", "id": msg_id, "result": handle_tools_call(server, params)}
+    if method in ("resources/list", "prompts/list"):
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+
+    return error_response(msg_id, -32601, f"method not found: {method}")
+
+
+def serve(server: Server) -> int:
+    log(f"serving project {server.project.alias!r} on {socket.gethostname()} (pid {os.getpid()})")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            send(error_response(None, -32700, f"parse error: {exc}"))
+            continue
+        if not isinstance(msg, dict):
+            send(error_response(None, -32600, "invalid request"))
+            continue
+        try:
+            response = handle(server, msg)
+        except Exception as exc:  # noqa: BLE001
+            log("request crashed:\n" + traceback.format_exc())
+            response = error_response(msg.get("id"), -32603, f"internal error: {exc}")
+        if response is not None:
+            send(response)
+    log("stdin closed; exiting")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lumi-mcp",
+        description="stdio MCP server for a LUMI project directory inside Apptainer.",
+    )
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("LUMI_MCP_CONFIG", str(DEFAULT_CONFIG)),
+        help=f"config file (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="project alias from the config; defaults to the project containing $PWD",
+    )
+    parser.add_argument("--status", action="store_true", help="print resolved status and exit")
+    parser.add_argument("--stop", action="store_true", help="stop this project's instance and exit")
+    parser.add_argument("--version", action="version", version=f"{SERVER_NAME} {SERVER_VERSION}")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        config = load_config(Path(args.config).expanduser())
+        project = select_project(config, args.project, Path.cwd())
+    except ConfigError as exc:
+        log(f"error: {exc}")
+        return 2
+
+    runtime_ok = os.path.isfile(config.command) and os.access(config.command, os.X_OK)
+    if not runtime_ok:
+        # --status is still useful for debugging a broken config, so only the
+        # serving path is fatal here.
+        msg = f"general.command is not an executable file: {config.command}"
+        if not args.status:
+            log(f"error: {msg}")
+            return 2
+        log(f"warning: {msg}")
+
+    runtime = Runtime(config.command)
+    server = Server(
+        config=config,
+        project=project,
+        runtime=runtime,
+        instance=Instance(runtime, project),
+    )
+
+    if args.status:
+        print(tool_status(server, {})[0])
+        return 0
+    if args.stop:
+        server.instance.stop()
+        print(f"stopped {server.instance.name}")
+        return 0
+
+    try:
+        return serve(server)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

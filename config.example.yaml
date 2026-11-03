@@ -1,0 +1,23 @@
+# $HOME/.lumi-mcp/config.yaml
+#
+# Every project here is an allowlist entry: the server can only ever see
+# the `directory` it is told about, and the agent cannot name a path that
+# is not in this file.
+
+general:
+  # Apptainer after the LUMI migration, singularity before it.
+  command: "/usr/bin/apptainer"
+
+projects:
+  - alias: "scaling_1"
+    description: "project_12345678 scaling tests set 1"
+    directory: "/scratch/project_12345678/scaling1"
+    image: "/scratch/project_12345678/my-img-1.sif"
+    account: "project_12345678"
+    # Fake HOME for the container. Created with mode 0700 if missing, and
+    # bound over ~ inside the container so nothing writes to the real HOME.
+    home: "/users/username/mcp-fake-home"
+    partition: "small"
+    # Exported before every command inside the container.
+    env:
+      HELLO: "/scratch/project_12345678/hello"
