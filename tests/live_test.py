@@ -15,6 +15,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -96,7 +97,7 @@ projects:
     image: "{image}"
     account: "project_00000000"
     home: "{remote['home']}"
-    partition: "small"
+    partition: "debug"
     env:
       - LIVE_MARK: "marker-set-by-config"
 CONF
@@ -134,7 +135,10 @@ echo pushed
     check("handshake over ssh", "result" in init, json.dumps(init))
     send("notifications/initialized", notify=True)
     tools = send("tools/list")["result"]["tools"]
-    check("tools advertised", [t["name"] for t in tools] == ["shell", "status"], str(tools))
+    check("tools advertised",
+          [t["name"] for t in tools]
+          == ["shell", "status", "slurm_submit", "slurm_jobs", "slurm_cancel", "slurm_logs"],
+          str([t["name"] for t in tools]))
 
     # ---- containment -----------------------------------------------------
     print("containment")
@@ -182,6 +186,89 @@ echo pushed
     out = text_of(r)
     check("timeout is reported", "timed_out: true" in out, out)
     check("timeout returns partial output", "before" in out, out)
+
+    # ---- the log directory is read-only inside the runner -----------------
+    print("log dir")
+    r = call("shell", {"command": "ls -d .mcp-jobs && (echo x > .mcp-jobs/evil || true) && (ln -s /tmp/target .mcp-jobs/evil || true) && ls -la .mcp-jobs"})
+    out = text_of(r)
+    check("log directory exists inside the container", ".mcp-jobs" in out, out)
+    check("cannot write into the log directory", "Read-only file system" in out, out)
+    check("both write attempts were refused", out.count("Read-only file system") >= 2, out)
+    r = call("shell", {"command": "ls -1 .mcp-jobs"})
+    check("nothing was planted in the log directory", "evil" not in text_of(r), text_of(r))
+    r = call("shell", {"command": "mv .mcp-jobs /tmp/stolen 2>&1 || true"})
+    check("cannot move the log directory away", "busy" in text_of(r).lower(), text_of(r))
+
+    st = json.loads(text_of(call("status", {})))
+    check("probe confirms the log dir is not writable",
+          st["instance"]["record"]["probe"].get("logdir_rw") == "no", str(st["instance"]))
+
+    # ---- slurm ------------------------------------------------------------
+    print("slurm")
+
+    def wait_for_state(job_id: int, wanted: tuple[str, ...], timeout: int = 120) -> tuple[str, str]:
+        deadline = time.time() + timeout
+        listing = ""
+        while time.time() < deadline:
+            listing = text_of(call("slurm_jobs", {}))
+            for line in listing.splitlines():
+                parts = line.split()
+                if len(parts) > 2 and parts[0] == str(job_id):
+                    if parts[1] in wanted:
+                        return parts[1], listing
+                    break
+            time.sleep(4)
+        return "", listing
+
+    payload = (
+        "echo in-job; id -un; pwd; "
+        "echo 'containment:'; ls /run/munge 2>&1 | head -1; "
+        "command -v sbatch || echo no-sbatch; "
+        "echo x > .mcp-jobs/evil 2>&1 || true; "
+        "echo done"
+    )
+    r = call("slurm_submit", {"name": "live-probe", "command": payload,
+                              "ntasks": 1, "time_minutes": 2})
+    out = text_of(r)
+    check("submit accepted", "job_id:" in out, out)
+    job_id = int(out.split("job_id:")[1].split()[0])
+    check("submit shows the generated script", "#SBATCH --job-name=live-probe" in out, out)
+    check("script carries the project partition", "#SBATCH --partition=debug" in out, out)
+
+    state, listing = wait_for_state(job_id, ("COMPLETED", "FAILED", "CANCELLED"))
+    check("job reaches a terminal state", state == "COMPLETED", f"state={state}\n{listing}")
+    check("job appears in slurm_jobs", str(job_id) in listing, listing)
+
+    r = call("slurm_logs", {"job_id": job_id})
+    logs = text_of(r)
+    check("logs are readable", "in-job" in logs and "done" in logs, logs)
+    check("payload ran inside the container",
+          "no-sbatch" in logs and "No such file" in logs, logs)
+    check("payload could not write into the log directory",
+          "Read-only file system" in logs, logs)
+
+    log_path = f"{remote['project']}/.mcp-jobs/{job_id}.out"
+    side = ssh.run(f"stat -c '%a %U %n' {log_path}")
+    check("log file is in the project's log directory", ".out" in side.stdout, side.stdout)
+    check("log file is owned by the user", side.returncode == 0 and " " in side.stdout, side.stdout)
+    mode = side.stdout.split()[0] if side.stdout.split() else ""
+    check("log file is not world-writable", not mode.endswith("2") and not mode.endswith("3") and not mode.endswith("6") and not mode.endswith("7"), side.stdout)
+
+    # cancelling something this server did not submit is refused
+    r = call("slurm_cancel", {"job_id": 999999})
+    check("refuses to cancel a foreign job id", r.get("isError") is True, text_of(r))
+
+    # a long job can be cancelled
+    r = call("slurm_submit", {"name": "live-sleeper", "command": "sleep 300", "time_minutes": 10})
+    sleep_id = int(text_of(r).split("job_id:")[1].split()[0])
+    state, listing = wait_for_state(sleep_id, ("RUNNING", "COMPLETED"))
+    check("sleeper job starts", state in ("RUNNING", "COMPLETED"), f"state={state}\n{listing}")
+    r = call("slurm_cancel", {"job_id": sleep_id})
+    out = text_of(r)
+    check("cancel reports a terminal state",
+          "CANCELLED" in out or "still in the queue: no" in out, out)
+    state, listing = wait_for_state(sleep_id, ("CANCELLED", "COMPLETED"))
+    check("cancelled job leaves the queue", state in ("CANCELLED", "COMPLETED"), listing)
 
     # ---- host side effects -----------------------------------------------
     print("host side")

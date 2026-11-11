@@ -26,6 +26,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -55,6 +56,23 @@ STATE_DIR = Path(os.environ.get("LUMI_MCP_STATE", Path.home() / ".lumi-mcp"))
 MAX_OUTPUT_BYTES = 64 * 1024
 DEFAULT_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 900
+
+# Job output goes here, inside the project directory so it survives and is
+# readable with normal tools -- but mounted READ-ONLY into both the tool
+# runner and the job's own container. Slurm opens --output on the compute node
+# as the user and follows symlinks, so a writable log directory would let the
+# agent point a job's stdout at any file it owns. Read-only closes that.
+LOG_DIR_NAME = ".mcp-jobs"
+
+DEFAULT_MAX_JOBS = 4
+DEFAULT_MAX_NTASKS = 8
+DEFAULT_MAX_WALLTIME_MINUTES = 60
+DEFAULT_QUERY_CACHE_S = 5.0
+
+SLURM_TIMEOUT_S = 60
+LOG_TAIL_LINES = 100
+MAX_LOG_TAIL_LINES = 500
+MAX_LOG_BYTES = 32 * 1024
 
 # Flags applied at `instance start`. These are the containment contract and
 # they are part of the instance identity, so changing this list yields new
@@ -115,6 +133,10 @@ class Config:
     path: Path
     command: str
     projects: list[Project]
+    max_jobs: int = DEFAULT_MAX_JOBS
+    max_ntasks: int = DEFAULT_MAX_NTASKS
+    max_walltime_minutes: int = DEFAULT_MAX_WALLTIME_MINUTES
+    query_cache_s: float = DEFAULT_QUERY_CACHE_S
 
     def by_alias(self, alias: str) -> Project:
         for p in self.projects:
@@ -158,6 +180,18 @@ def load_config(path: Path) -> Config:
     command = str(general.get("command") or "").strip()
     if not command:
         raise ConfigError(f"{path}: general.command is required (e.g. /usr/bin/apptainer)")
+
+    def number(key: str, default: float, minimum: float, cast=float):
+        raw_value = general.get(key)
+        if raw_value is None:
+            return default
+        try:
+            value = cast(raw_value)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{path}: general.{key} must be a number") from None
+        if value < minimum:
+            raise ConfigError(f"{path}: general.{key} must be >= {minimum}")
+        return value
 
     entries = raw.get("projects")
     if not isinstance(entries, list) or not entries:
@@ -214,7 +248,17 @@ def load_config(path: Path) -> Config:
             )
         )
 
-    return Config(path=path, command=command, projects=projects)
+    return Config(
+        path=path,
+        command=command,
+        projects=projects,
+        max_jobs=int(number("max_jobs", DEFAULT_MAX_JOBS, 1, int)),
+        max_ntasks=int(number("max_ntasks", DEFAULT_MAX_NTASKS, 1, int)),
+        max_walltime_minutes=int(
+            number("max_walltime_minutes", DEFAULT_MAX_WALLTIME_MINUTES, 1, int)
+        ),
+        query_cache_s=number("query_cache_s", DEFAULT_QUERY_CACHE_S, 0.0),
+    )
 
 
 def path_is_under(child: Path, parent: Path) -> bool:
@@ -260,6 +304,26 @@ def select_project(config: Config, alias: str | None, cwd: Path) -> Project:
         f"cannot choose a project: {real_cwd} is not inside any configured project "
         f"and --project was not given (known: {aliases})"
     )
+
+
+def job_log_dir(project: Project) -> Path:
+    return project.directory / LOG_DIR_NAME
+
+
+def bind_specs(project: Project) -> list[str]:
+    """The complete mount set for both the runner and the job's container.
+
+    Order matters: the read-only log directory has to come after the
+    read-write project directory it lives inside, otherwise the ro mount is
+    hidden by the parent bind.
+    """
+    directory = str(project.directory)
+    logs = str(job_log_dir(project))
+    return [
+        f"{directory}:{directory}",
+        f"{logs}:{logs}:ro",
+        f"{project.home}:{host_home()}",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -345,11 +409,11 @@ class Runtime:
         if self.flags().no_start:
             argv.append("--no-start")
         argv.extend(self.start_flags())
-        argv.extend(["-B", f"{project.directory}:{project.directory}"])
-        # Bind destination must be absolute, and `~` is not accepted. Using the
-        # host $HOME as the destination keeps paths identical inside and out
-        # while the contents are the project's throwaway home.
-        argv.extend(["-B", f"{project.home}:{host_home()}"])
+        # Bind destinations must be absolute; `~` is rejected. The fake home is
+        # bound over the host $HOME so paths stay identical while the contents
+        # are the project's throwaway home.
+        for spec in bind_specs(project):
+            argv.extend(["-B", spec])
         argv.extend([str(project.image), name])
 
         log("starting instance: " + " ".join(shlex.quote(a) for a in argv))
@@ -373,10 +437,13 @@ class Runtime:
         after the instance starts and their result is recorded and reported by
         `status`.
         """
+        logs = shlex.quote(str(job_log_dir(project)))
         script = "; ".join(
             [
                 f"test -d {shlex.quote(str(project.directory))} && echo project=ok || echo project=missing",
                 f"test -w {shlex.quote(str(project.directory))} && echo project_rw=yes || echo project_rw=no",
+                f"test -d {logs} && echo logdir=ok || echo logdir=missing",
+                f"(: > {logs}/.probe) 2>/dev/null && echo logdir_rw=yes || echo logdir_rw=no",
                 "test -S /run/munge/munge.socket.2 && echo munge=visible || echo munge=absent",
                 "command -v sbatch >/dev/null 2>&1 && echo sbatch=present || echo sbatch=absent",
                 f"test -e {shlex.quote(str(host_home()))}/.ssh && echo host_home=visible || echo host_home=hidden",
@@ -396,6 +463,10 @@ class Runtime:
         for key, expected, level in (
             ("project", "ok", "error"),
             ("project_rw", "yes", "error"),
+            ("logdir", "ok", "error"),
+            # Slurm follows symlinks when it opens --output, so a writable log
+            # directory is an escape from the containment, not a nit.
+            ("logdir_rw", "no", "error"),
             ("munge", "absent", "warn"),
             ("host_home", "hidden", "warn"),
         ):
@@ -435,6 +506,7 @@ def instance_name(project: Project, runtime: Runtime) -> str:
         "image": image_stamp(project.image),
         "runtime": runtime.command,
         "flags": runtime.start_flags(),
+        "binds": bind_specs(project),
     }
     blob = json.dumps(payload, sort_keys=True).encode()
     return "lumi-mcp-" + hashlib.sha256(blob).hexdigest()[:12]
@@ -543,15 +615,31 @@ class Instance:
                 self.project.home.mkdir(parents=True, exist_ok=True)
             os.chmod(self.project.home, 0o700)
 
+            # The read-only log directory has to exist before the instance
+            # starts: a bind whose source is missing fails the start.
+            logs = job_log_dir(self.project)
+            try:
+                logs.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ToolError(f"cannot create log directory {logs}: {exc}") from None
+
             self.runtime.instance_start(self.name, self.project)
             probe = self.runtime.probe_containment(self.name, self.project)
-            if probe.get("project") != "ok" or probe.get("project_rw") != "yes":
-                # The project must be visible and writable or nothing else
-                # matters; do not hand out an instance that cannot do its job.
-                self.runtime.instance_stop(self.name)
-                raise ToolError(
-                    f"containment probe failed for project {self.project.alias}: {probe}"
-                )
+            required = (
+                ("project", "ok"),
+                ("project_rw", "yes"),
+                ("logdir", "ok"),
+                ("logdir_rw", "no"),
+            )
+            for key, expected in required:
+                if probe.get(key) != expected:
+                    # Do not hand out an instance that cannot do its job, or
+                    # one whose log directory the agent could write to.
+                    self.runtime.instance_stop(self.name)
+                    raise ToolError(
+                        f"containment probe failed for project {self.project.alias}: "
+                        f"{key}={probe.get(key)!r} (expected {expected!r}); full probe: {probe}"
+                    )
             self.write_record(created=True, probe=probe)
             return self.read_record() or {}, True
 
@@ -654,6 +742,180 @@ def run_in_instance(
 # server state and tools
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# slurm
+# --------------------------------------------------------------------------
+
+
+def slurm(*argv: str, timeout: float = SLURM_TIMEOUT_S) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            list(argv),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise ToolError(f"{argv[0]} not found on PATH; is Slurm installed on this host?") from None
+    except subprocess.SubprocessError as exc:
+        raise ToolError(f"{argv[0]} failed: {exc}") from None
+
+
+def available_partitions(configured: str) -> str:
+    """Best-effort hint when sbatch refuses a partition."""
+    try:
+        proc = subprocess.run(
+            ["sinfo", "-h", "-o", "%P"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return f"could not run sinfo; config asks for partition {configured!r}"
+    names = sorted({p.strip().rstrip("*") for p in proc.stdout.decode().split() if p.strip()})
+    if not names:
+        return "sinfo reported no partitions"
+    hint = "partitions on this host: " + ", ".join(names)
+    if configured not in names:
+        hint += f"  (config asks for {configured!r})"
+    return hint
+
+
+def time_limit(minutes: int) -> str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
+
+
+JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def build_job_script(
+    server: "Server",
+    *,
+    name: str,
+    command: str,
+    ntasks: int,
+    minutes: int,
+) -> str:
+    """Render the batch script.
+
+    Every agent-supplied value is a *value* in a line we own: the name is
+    regex-validated, the numbers are ints, and the payload is quoted as a
+    single argv element for sh -c inside the container. The agent never gets
+    to write an #SBATCH line or the srun/container invocation itself.
+    """
+    project = server.project
+    directory = str(project.directory)
+    logs = str(job_log_dir(project))
+
+    container: list[str] = [
+        server.runtime.command,
+        "exec",
+        *server.runtime.start_flags(),
+        "--pwd",
+        directory,
+    ]
+    for spec in bind_specs(project):
+        container.extend(["-B", spec])
+    container.extend([str(project.image), "/bin/sh", "-c", command])
+
+    lines = [
+        "#!/bin/bash",
+        f"#SBATCH --job-name={name}",
+        f"#SBATCH --partition={project.partition}",
+        f"#SBATCH --account={project.account}",
+        "#SBATCH --nodes=1",
+        f"#SBATCH --ntasks={ntasks}",
+        f"#SBATCH --time={time_limit(minutes)}",
+        f"#SBATCH --chdir={directory}",
+        f"#SBATCH --output={logs}/%j.out",
+        f"#SBATCH --error={logs}/%j.out",
+        f"#SBATCH --comment=lumi-mcp:{project.alias}",
+        "set -euo pipefail",
+        "umask 077",
+        f"exec srun --ntasks={ntasks} {shlex.join(container)}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+class Ledger:
+    """Append-only record of the jobs this server submitted.
+
+    The agent chooses job names, so names cannot be an identity. Ownership is
+    decided by this file, which lives outside every container.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def append(self, record: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a") as fh:
+            fh.write(json.dumps(record) + "\n")
+        os.chmod(self.path, 0o600)
+
+    def entries(self, alias: str, limit: int = 20) -> list[dict[str, Any]]:
+        try:
+            lines = self.path.read_text().splitlines()
+        except FileNotFoundError:
+            return []
+        out: list[dict[str, Any]] = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("alias") == alias:
+                out.append(record)
+        return out[-limit:]
+
+    def has(self, alias: str, job_id: int) -> dict[str, Any] | None:
+        for record in self.entries(alias, limit=10_000):
+            if record.get("job_id") == job_id:
+                return record
+        return None
+
+    def active_count(self, alias: str, live_ids: set[int]) -> int:
+        return sum(1 for r in self.entries(alias, limit=10_000) if r.get("job_id") in live_ids)
+
+
+def job_state(job_id: int) -> dict[str, str]:
+    """One id at a time: scontrol does not take a comma list."""
+    proc = slurm("scontrol", "show", "job", str(job_id), "-o")
+    text = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0 or not text:
+        return {}
+    return dict(
+        token.split("=", 1) for token in text.split() if "=" in token
+    )
+
+
+def live_states(job_ids: list[int]) -> dict[int, dict[str, str]]:
+    """Batch query for jobs the controller still knows about."""
+    if not job_ids:
+        return {}
+    proc = slurm(
+        "squeue",
+        "-h",
+        "-j",
+        ",".join(str(j) for j in job_ids),
+        "-o",
+        "%A|%T|%N|%r|%M|%l",
+    )
+    out: dict[int, dict[str, str]] = {}
+    for line in (proc.stdout or b"").decode("utf-8", "replace").splitlines():
+        parts = line.split("|")
+        if len(parts) != 6 or not parts[0].isdigit():
+            continue
+        job_id, state, nodes, reason, elapsed, limit = parts
+        out[int(job_id)] = {
+            "state": state,
+            "nodes": nodes,
+            "reason": reason,
+            "elapsed": elapsed,
+            "time_limit": limit,
+        }
+    return out
 
 @dataclass
 class Server:
@@ -661,6 +923,8 @@ class Server:
     project: Project
     runtime: Runtime
     instance: Instance
+    ledger: Ledger
+    jobs_cache: tuple[float, str] | None = None
 
 
 def tool_shell(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
@@ -731,6 +995,18 @@ def tool_status(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
             "alive": alive,
             "record": record,
         },
+        "slurm": {
+            "account": server.project.account,
+            "partition": server.project.partition,
+            "log_dir": str(job_log_dir(server.project)),
+            "max_jobs": server.config.max_jobs,
+            "max_ntasks": server.config.max_ntasks,
+            "max_walltime_minutes": server.config.max_walltime_minutes,
+            "known_jobs": [
+                {"job_id": r["job_id"], "name": r["name"], "submitted_at": r["submitted_at"]}
+                for r in server.ledger.entries(server.project.alias, limit=20)
+            ],
+        },
         "limits": {
             "default_timeout_s": DEFAULT_TIMEOUT_S,
             "max_timeout_s": MAX_TIMEOUT_S,
@@ -738,6 +1014,266 @@ def tool_status(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
         },
     }
     return json.dumps(info, indent=2), False
+
+
+def _int_arg(args: dict[str, Any], key: str, default: int) -> int:
+    raw = args.get(key, default)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ToolError(f"{key} must be an integer")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ToolError(f"{key} must be an integer") from None
+
+
+def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
+    command = args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ToolError("command must be a non-empty string")
+
+    name = str(args.get("name") or "").strip()
+    if not JOB_NAME_RE.fullmatch(name):
+        raise ToolError(
+            "name must be 1-64 characters of letters, digits, '_', '.', '-' "
+            "and must start with a letter or digit"
+        )
+
+    ntasks = _int_arg(args, "ntasks", 1)
+    if not 1 <= ntasks <= server.config.max_ntasks:
+        raise ToolError(f"ntasks must be between 1 and {server.config.max_ntasks}")
+
+    minutes = _int_arg(args, "time_minutes", 10)
+    if not 1 <= minutes <= server.config.max_walltime_minutes:
+        raise ToolError(
+            f"time_minutes must be between 1 and {server.config.max_walltime_minutes}"
+        )
+
+    known = [r["job_id"] for r in server.ledger.entries(server.project.alias, limit=10_000)]
+    active = live_states(known[-50:])
+    if len(active) >= server.config.max_jobs:
+        raise ToolError(
+            f"refusing to submit: {len(active)} job(s) already queued or running "
+            f"(max_jobs={server.config.max_jobs}). Cancel one with slurm_cancel or wait."
+        )
+
+    script_text = build_job_script(
+        server, name=name, command=command, ntasks=ntasks, minutes=minutes
+    )
+
+    scripts_dir = STATE_DIR / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(scripts_dir, 0o700)
+    script_path = scripts_dir / f"{os.urandom(6).hex()}.sh"
+    fd = os.open(script_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(script_text)
+
+    # --export=NONE: sbatch would otherwise inherit this process's
+    # environment, which is the harness's, tokens and all.
+    proc = slurm("sbatch", "--parsable", "--export=NONE", str(script_path))
+    stdout = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        hint = ""
+        if "partition" in (stderr or stdout).lower():
+            hint = "\n" + available_partitions(server.project.partition)
+        raise ToolError(f"sbatch failed (exit {proc.returncode}): {stderr or stdout}{hint}")
+
+    first = stdout.splitlines()[0] if stdout else ""
+    job_id_text = first.split(";")[-1].strip()
+    if not job_id_text.isdigit():
+        raise ToolError(f"could not parse a job id from sbatch output: {stdout!r}")
+
+    job_id = int(job_id_text)
+    log_path = job_log_dir(server.project) / f"{job_id}.out"
+    record = {
+        "job_id": job_id,
+        "alias": server.project.alias,
+        "name": name,
+        "ntasks": ntasks,
+        "time_limit": time_limit(minutes),
+        "command": command[:4000],
+        "submitted_at": time.time(),
+        "script": str(script_path),
+        "log": str(log_path),
+        "account": server.project.account,
+        "partition": server.project.partition,
+    }
+    server.ledger.append(record)
+    server.jobs_cache = None
+
+    text = "\n".join(
+        [
+            f"job_id: {job_id}",
+            f"name: {name}",
+            f"partition: {server.project.partition}  account: {server.project.account}",
+            f"ntasks: {ntasks}  time_limit: {time_limit(minutes)}",
+            f"log: {log_path}",
+            "",
+            "The job is queued. It runs unattended: poll with slurm_jobs and read "
+            "output with slurm_logs. Cancelling is slurm_cancel.",
+            "",
+            "--- generated script ---",
+            script_text.rstrip("\n"),
+        ]
+    )
+    return text, False
+
+
+def _job_rows(server: Server) -> list[dict[str, Any]]:
+    entries = server.ledger.entries(server.project.alias, limit=20)
+    ids = [e["job_id"] for e in entries]
+    live = live_states(ids)
+    rows = []
+    for entry in entries:
+        job_id = entry["job_id"]
+        state = live.get(job_id)
+        if state:
+            rows.append({**entry, **state, "source": "squeue"})
+            continue
+        info = job_state(job_id)
+        rows.append(
+            {
+                **entry,
+                "state": info.get("JobState", "UNKNOWN"),
+                "reason": info.get("Reason", "") if info.get("Reason") != "None" else "",
+                "nodes": info.get("NodeList", ""),
+                "elapsed": info.get("RunTime", ""),
+                "exit_code": info.get("ExitCode", ""),
+                "source": "scontrol" if info else "gone",
+            }
+        )
+    return rows
+
+
+def tool_slurm_jobs(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
+    now = time.monotonic()
+    if server.jobs_cache is not None:
+        stamp, cached = server.jobs_cache
+        age = now - stamp
+        if age < server.config.query_cache_s:
+            return f"{cached}\n\n(cached {age:.0f}s ago; refreshed every {server.config.query_cache_s:g}s)", False
+
+    rows = _job_rows(server)
+    if not rows:
+        return (
+            f"no jobs submitted by this server for {server.project.alias}. "
+            "Use slurm_submit.",
+            False,
+        )
+
+    header = f"{'job':>6}  {'state':<10} {'elapsed':<8} {'name':<20} {'where':<24} note"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        exit_code = row.get("exit_code") or ""
+        note = f"exit {exit_code}" if exit_code and exit_code != "0:0" else (row.get("reason") or "")
+        lines.append(
+            f"{row['job_id']:>6}  {row['state']:<10} "
+            f"{(row.get('elapsed') or ''):<8} {row['name'][:20]:<20} "
+            f"{(row.get('nodes') or ''):<24} {note}"
+        )
+    lines.append("")
+    lines.append(f"logs: {job_log_dir(server.project)}/<job_id>.out")
+    lines.append(
+        "states come from squeue/scontrol only; without a slurmdbd there is no "
+        "accounting history, so old finished jobs drop out of the controller's "
+        "memory. The ledger above is this server's own record."
+    )
+    text = "\n".join(lines)
+    server.jobs_cache = (now, text)
+    return text, False
+
+
+def tool_slurm_cancel(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
+    job_id = _int_arg(args, "job_id", 0)
+    if job_id <= 0:
+        raise ToolError("job_id must be a positive integer")
+
+    record = server.ledger.has(server.project.alias, job_id)
+    if record is None:
+        # scancel exits 0 even for job ids that do not exist, so the ledger is
+        # the only thing standing between the agent and other people's jobs.
+        raise ToolError(
+            f"job {job_id} was not submitted by this server for "
+            f"{server.project.alias!r}; refusing to cancel it"
+        )
+
+    before = job_state(job_id)
+    finished = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL")
+    if before.get("JobState") in finished:
+        return (
+            f"job {job_id} ({record['name']}) had already finished: "
+            f"{before.get('JobState')}\nnothing to cancel.\nlog: {record['log']}",
+            False,
+        )
+
+    proc = slurm("scancel", str(job_id))
+    server.jobs_cache = None
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        raise ToolError(f"scancel {job_id} failed (exit {proc.returncode}): {err}")
+
+    # Slurm moves through CANCELLING/COMPLETING before it lets go; a short
+    # poll keeps the answer honest without making the agent wait.
+    deadline = time.monotonic() + 3.0
+    state = ""
+    still = True
+    while True:
+        info = job_state(job_id)
+        state = info.get("JobState", "unknown")
+        still = job_id in live_states([job_id])
+        if state in ("CANCELLED", "COMPLETED", "FAILED", "TIMEOUT") and not still:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+
+    text = "\n".join(
+        [
+            f"job_id: {job_id}  ({record['name']})",
+            f"state: {state}",
+            f"still in the queue: {'yes' if still else 'no'}"
+            + ("" if not still else " (Slurm is still tearing it down; check slurm_jobs)"),
+            f"log: {record['log']}",
+        ]
+    )
+    return text, False
+
+
+def tool_slurm_logs(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
+    job_id = _int_arg(args, "job_id", 0)
+    if job_id <= 0:
+        raise ToolError("job_id must be a positive integer")
+    lines_wanted = min(max(_int_arg(args, "lines", LOG_TAIL_LINES), 1), MAX_LOG_TAIL_LINES)
+
+    record = server.ledger.has(server.project.alias, job_id)
+    path = Path(record["log"]) if record else job_log_dir(server.project) / f"{job_id}.out"
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > MAX_LOG_BYTES:
+                fh.seek(-MAX_LOG_BYTES, os.SEEK_END)
+                data = fh.read()
+                skipped = size - MAX_LOG_BYTES
+            else:
+                data = fh.read()
+                skipped = 0
+    except FileNotFoundError:
+        raise ToolError(
+            f"no log for job {job_id} at {path}. Slurm creates it when the job "
+            "starts; a pending job has no output yet."
+        ) from None
+    except OSError as exc:
+        raise ToolError(f"cannot read {path}: {exc}") from None
+
+    text = data.decode("utf-8", "replace")
+    tail = text.splitlines()[-lines_wanted:]
+    body = "\n".join(tail)
+    prefix = []
+    if skipped:
+        prefix.append(f"[... {skipped} bytes skipped, showing the last {MAX_LOG_BYTES}]")
+    prefix.append(f"log: {path} ({size} bytes)")
+    return "\n".join(prefix) + "\n" + body, False
 
 
 TOOLS = [
@@ -781,6 +1317,87 @@ TOOLS = [
         ),
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "slurm_submit",
+        "description": (
+            "Submit a batch job to the cluster. You supply a job name, the payload "
+            "command and the resource request; the server writes the batch script "
+            "itself from a fixed template, so the account, partition, container "
+            "invocation and read-only log directory are not yours to change. The "
+            "payload runs inside the same container image as `shell`, on a compute "
+            "node. Returns the job id and the generated script. Returns immediately "
+            "-- use slurm_jobs to follow it and slurm_logs for the output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Job name, visible in squeue. 1-64 chars of A-Z a-z 0-9 _ . -",
+                },
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "Shell command to run inside the container on the compute node, "
+                        "executed with /bin/sh -c from the project directory."
+                    ),
+                },
+                "ntasks": {
+                    "type": "integer",
+                    "description": "MPI ranks (srun --ntasks) and cores requested. Default 1.",
+                },
+                "time_minutes": {
+                    "type": "integer",
+                    "description": "Wall-clock limit in minutes. Default 10.",
+                },
+            },
+            "required": ["name", "command"],
+        },
+    },
+    {
+        "name": "slurm_jobs",
+        "description": (
+            "List the jobs this server submitted for this project with their current "
+            "state, elapsed time, node and the Slurm pending reason. Cheap to poll; "
+            "results are cached for a few seconds. Jobs not submitted through this "
+            "server are not listed."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "slurm_cancel",
+        "description": (
+            "Cancel a job. Only jobs this server submitted for this project can be "
+            "cancelled; anything else is refused. Reports the resulting state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer", "description": "Job id from slurm_submit or slurm_jobs."}
+            },
+            "required": ["job_id"],
+        },
+    },
+    {
+        "name": "slurm_logs",
+        "description": (
+            "Return the tail of a job's combined stdout/stderr. The log directory is "
+            "mounted read-only inside the container, so these files can be read but "
+            "not written, replaced or deleted. Output is bounded; widen the tail with "
+            "`lines`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "integer", "description": "Job id to read."},
+                "lines": {
+                    "type": "integer",
+                    "description": "Trailing lines to return (default 100, max 500).",
+                },
+            },
+            "required": ["job_id"],
+        },
+    },
 ]
 
 INSTRUCTIONS = (
@@ -790,8 +1407,13 @@ INSTRUCTIONS = (
     "verbatim. Only the project directory and a private HOME are writable; the "
     "rest of the host filesystem is not mounted. The instance keeps running "
     "between calls, so background processes and their PIDs persist -- use "
-    "`shell` with ps/kill to manage them. Long or parallel work belongs on "
-    "compute nodes via Slurm, which this server does not yet expose."
+    "`shell` with ps/kill to manage them.\n\n"
+    "Long or parallel work belongs on compute nodes: `slurm_submit` takes a job "
+    "name, a payload command and a resource request, and writes the batch script "
+    "itself -- account {account}, partition {partition}, and the payload inside the "
+    "same container image, so you cannot submit a job that runs outside it. Poll "
+    "with `slurm_jobs`, read output with `slurm_logs`, stop it with `slurm_cancel`. "
+    "Job output lands in {log_dir} and is mounted read-only here."
 )
 
 
@@ -801,7 +1423,14 @@ def handle_tools_call(server: Server, params: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(args, dict):
         return _text_result("arguments must be an object", is_error=True)
 
-    handlers = {"shell": tool_shell, "status": tool_status}
+    handlers = {
+        "shell": tool_shell,
+        "status": tool_status,
+        "slurm_submit": tool_slurm_submit,
+        "slurm_jobs": tool_slurm_jobs,
+        "slurm_cancel": tool_slurm_cancel,
+        "slurm_logs": tool_slurm_logs,
+    }
     handler = handlers.get(name)
     if handler is None:
         return _text_result(f"unknown tool: {name!r}", is_error=True)
@@ -860,6 +1489,9 @@ def handle(server: Server, msg: dict[str, Any]) -> dict[str, Any] | None:
                     alias=server.project.alias,
                     directory=server.project.directory,
                     host=socket.gethostname(),
+                    account=server.project.account,
+                    partition=server.project.partition,
+                    log_dir=job_log_dir(server.project),
                 ),
             },
         }
@@ -954,6 +1586,7 @@ def main(argv: list[str] | None = None) -> int:
         project=project,
         runtime=runtime,
         instance=Instance(runtime, project),
+        ledger=Ledger(STATE_DIR / "jobs.jsonl"),
     )
 
     if args.status:

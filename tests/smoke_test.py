@@ -58,11 +58,79 @@ case "$cmd" in
     # exec instance://NAME <argv...>
     shift
     [ -f "$FAKE_LOG/starts" ] || { echo "no such instance" >&2; exit 1; }
+    # The fake cannot create a read-only bind, so the containment probe's
+    # "can I write into the log directory" line is rewritten here. The live
+    # test against real Apptainer checks this for real.
+    case "$*" in
+      *logdir_rw=*)
+        "$@" | sed 's/^logdir_rw=yes$/logdir_rw=no/'
+        exit ${PIPESTATUS[0]} ;;
+    esac
     exec "$@" ;;
 esac
 echo "unsupported: $cmd" >&2
 exit 1
 """
+
+FAKE_SLURM = {
+    "sbatch": r"""#!/bin/bash
+# sbatch --parsable --export=NONE <script>
+script=""
+for a in "$@"; do
+  case "$a" in
+    --parsable|--export=NONE|-*) ;;
+    *) script="$a" ;;
+  esac
+done
+[ -n "$script" ] || { echo "no script argument" >&2; exit 1; }
+mkdir -p "$FAKE_LOG/slurm"
+id=$(cat "$FAKE_LOG/slurm/next" 2>/dev/null || echo 100)
+echo $((id+1)) > "$FAKE_LOG/slurm/next"
+cp "$script" "$FAKE_LOG/slurm/$id.sh"
+touch "$FAKE_LOG/slurm/active-$id"
+echo "$id"
+""",
+    "squeue": r"""#!/bin/bash
+# squeue -h -j <ids> -o <fmt>
+ids=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j) ids="$2"; shift 2 ;;
+    -o) shift 2 ;;
+    *) shift ;;
+  esac
+done
+for id in $(echo "$ids" | tr ',' ' '); do
+  [ -f "$FAKE_LOG/slurm/active-$id" ] && echo "$id|PENDING||Resources|0:01|10:00"
+done
+exit 0
+""",
+    "scontrol": r"""#!/bin/bash
+# scontrol show job <id> -o
+id="$3"
+if [ -f "$FAKE_LOG/slurm/cancelled-$id" ]; then
+  echo "JobId=$id JobState=CANCELLED Reason=None ExitCode=0:0 RunTime=00:00:01 NodeList= WorkDir=/tmp"
+elif [ -f "$FAKE_LOG/slurm/active-$id" ]; then
+  echo "JobId=$id JobState=RUNNING Reason=None ExitCode=0:0 RunTime=00:00:01 NodeList=node1 WorkDir=/tmp"
+else
+  echo "JobId=$id JobState=COMPLETED Reason=None ExitCode=0:0 RunTime=00:00:05 NodeList=node1 WorkDir=/tmp"
+fi
+exit 0
+""",
+    "scancel": r"""#!/bin/bash
+# scancel exits 0 even for ids that do not exist -- the fake does too
+for id in "$@"; do
+  rm -f "$FAKE_LOG/slurm/active-$id"
+  touch "$FAKE_LOG/slurm/cancelled-$id"
+done
+exit 0
+""",
+    "srun": r"""#!/bin/bash
+# records its argv so the test can check how the payload was quoted
+printf '%s\n' "$@" > "$FAKE_LOG/srun-argv"
+exit 0
+""",
+}
 
 
 class Harness:
@@ -146,11 +214,21 @@ def run(tmp: Path) -> int:
     runtime.write_text(FAKE_RUNTIME)
     runtime.chmod(0o755)
 
+    sbin = tmp / "sbin"
+    sbin.mkdir()
+    for name, body in FAKE_SLURM.items():
+        path = sbin / name
+        path.write_text(body)
+        path.chmod(0o755)
+
     config = tmp / "config.yaml"
     config.write_text(
         f"""
 general:
   command: "{runtime}"
+  max_jobs: 2
+  max_ntasks: 4
+  max_walltime_minutes: 30
 
 projects:
   - alias: "scaling_1"
@@ -175,6 +253,7 @@ projects:
     env = dict(os.environ)
     env["LUMI_MCP_STATE"] = str(state)
     env["FAKE_LOG"] = str(logdir)
+    env["PATH"] = f"{sbin}:{os.environ['PATH']}"
 
     # ---- offline modes ---------------------------------------------------
     print("offline modes")
@@ -240,7 +319,10 @@ projects:
 
     h.send("notifications/initialized", notify=True)
     tools = h.send("tools/list")["result"]["tools"]
-    check("two tools registered", [t["name"] for t in tools] == ["shell", "status"], str(tools))
+    check("tools registered",
+          [t["name"] for t in tools]
+          == ["shell", "status", "slurm_submit", "slurm_jobs", "slurm_cancel", "slurm_logs"],
+          str([t["name"] for t in tools]))
     check("shell schema requires command",
           tools[0]["inputSchema"]["required"] == ["command"])
 
@@ -320,6 +402,85 @@ projects:
     # instance identity must not change with policy
     check("instance name is stable for the same containment",
           h.send("tools/list")["result"]["tools"][1]["name"] == "status")
+
+    # ---- slurm -----------------------------------------------------------
+    print("slurm")
+    payload = """x'; touch /tmp/lumi-mcp-pwned; echo '"""
+    r = h.call("slurm_submit", {"name": "scale-run", "command": payload,
+                               "ntasks": 2, "time_minutes": 15})
+    text = text_of(r)
+    check("submit returns a job id", "job_id: 100" in text, text)
+    check("submit echoes the generated script", "#SBATCH --job-name=scale-run" in text, text)
+    script = text.split("--- generated script ---", 1)[1].strip()
+    (logdir / "slurm" / "100.sh").exists() or None
+
+    check("partition comes from the config", "#SBATCH --partition=small" in script, script)
+    check("account comes from the config", "#SBATCH --account=project_12345678" in script, script)
+    check("chdir is the project", f"#SBATCH --chdir={project}" in script, script)
+    check("logs land in the read-only log dir with %j",
+          f"#SBATCH --output={project}/.mcp-jobs/%j.out" in script, script)
+    check("job name is a value, not a line", "#SBATCH --job-name=scale-run\n" in script + "\n", script)
+    check("no --wrap and no --export in the script",
+          "--wrap" not in script and "--export" not in script, script)
+    check("log directory is bound read-only", f"{project}/.mcp-jobs:{project}/.mcp-jobs:ro" in script, script)
+    check("container invocation carries --pwd", "--pwd" in script, script)
+
+    # The script must be valid bash and must deliver the payload as ONE argv
+    # element. Run it for real with a fake srun that records its arguments.
+    script_path = logdir / "slurm" / "100.sh"
+    run_env = dict(env)
+    proc = subprocess.run(["bash", "-n", str(script_path)], capture_output=True, text=True)
+    check("generated script is valid bash", proc.returncode == 0, proc.stderr)
+    proc = subprocess.run(["bash", str(script_path)], capture_output=True, text=True, env=run_env)
+    check("generated script runs", proc.returncode == 0, proc.stderr)
+    argv = (logdir / "srun-argv").read_text().splitlines()
+    check("payload arrives as a single argv element", argv[-1] == payload, repr(argv[-3:]))
+    check("payload was not executed by the host shell", not Path("/tmp/lumi-mcp-pwned").exists())
+    check("srun gets the container invocation, not the payload alone",
+          "apptainer" in argv[1] and "--contain" in argv, str(argv))
+
+    # slurm_jobs surfaces state and the pending reason
+    (logdir / "slurm" / "active-100").write_text("")
+    r = h.call("slurm_jobs", {})
+    text = text_of(r)
+    check("jobs lists the submitted job", "100" in text and "scale-run" in text, text)
+    check("jobs shows the pending reason", "Resources" in text, text)
+    r = h.call("slurm_jobs", {})
+    check("second query is served from cache", "cached" in text_of(r), text_of(r))
+
+    # logs
+    (project / ".mcp-jobs" / "100.out").write_text("line one\nline two\nline three\n")
+    r = h.call("slurm_logs", {"job_id": 100, "lines": 2})
+    check("logs returns the requested tail",
+          "line two" in text_of(r) and "line one" not in text_of(r), text_of(r))
+    r = h.call("slurm_logs", {"job_id": 999})
+    check("missing log is a clean error", r.get("isError") is True, text_of(r))
+
+    # cancel: ledger matters, because scancel exits 0 regardless
+    r = h.call("slurm_cancel", {"job_id": 999})
+    check("refuses to cancel a job it did not submit",
+          r.get("isError") is True and "not submitted" in text_of(r), text_of(r))
+    r = h.call("slurm_cancel", {"job_id": 100})
+    check("cancels its own job", "CANCELLED" in text_of(r), text_of(r))
+    check("scancel was actually called", (logdir / "slurm" / "cancelled-100").exists())
+
+    # limits
+    r = h.call("slurm_submit", {"name": "too-many-tasks", "command": "true", "ntasks": 99})
+    check("ntasks above the limit is refused", r.get("isError") is True, text_of(r))
+    r = h.call("slurm_submit", {"name": "too-long", "command": "true", "time_minutes": 100000})
+    check("walltime above the limit is refused", r.get("isError") is True, text_of(r))
+    r = h.call("slurm_submit", {"name": "bad name; rm -rf /", "command": "true"})
+    check("a job name that is not a name is refused", r.get("isError") is True, text_of(r))
+
+    # max_jobs = 2 in the test config; fill the queue with real submissions
+    for n in range(2):
+        r = h.call("slurm_submit", {"name": f"fill-{n}", "command": "true"})
+        check(f"submission {n + 1} of 2 is accepted", not r.get("isError"), text_of(r))
+    r = h.call("slurm_submit", {"name": "one-too-many", "command": "true"})
+    check("submission beyond max_jobs is refused",
+          r.get("isError") is True and "max_jobs" in text_of(r), text_of(r))
+    for path in (logdir / "slurm").glob("active-*"):
+        path.unlink()
 
     # ---- shutdown --------------------------------------------------------
     print("shutdown")

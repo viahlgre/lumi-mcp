@@ -8,6 +8,12 @@ general:
   # Apptainer after the LUMI migration, singularity before it.
   command: "/usr/bin/apptainer"
 
+  # Job limits for the slurm_* tools. All optional; these are the defaults.
+  max_jobs: 4                 # queued+running jobs this server will own
+  max_ntasks: 8               # srun --ntasks ceiling
+  max_walltime_minutes: 60    # --time ceiling
+  query_cache_s: 5            # how long slurm_jobs serves a cached answer
+
 projects:
   - alias: "scaling_1"
     description: "project_12345678 scaling tests set 1"
