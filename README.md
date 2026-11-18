@@ -64,8 +64,8 @@ the agent doesn't supply syntax, but only values:
 #SBATCH --ntasks=<int, capped>
 #SBATCH --time=<validated HH:MM:SS>
 #SBATCH --chdir=<project directory>
-#SBATCH --output=<project>/.mcp-jobs/%j.out
-#SBATCH --error=<project>/.mcp-jobs/%j.out
+#SBATCH --output=<project>/.mcp-jobs/<alias>/%j.out
+#SBATCH --error=<project>/.mcp-jobs/<alias>/%j.out
 #SBATCH --comment=lumi-mcp:<alias>
 set -euo pipefail
 umask 077
@@ -85,7 +85,7 @@ the job id plus a copy of the command go into `$LUMI_MCP_STATE/jobs.jsonl`.
 
 Slurm opens `--output` on the compute node as the user and follows
 symlinks. The project directory is agent-writable, so a symlink planted at
-`<project>/.mcp-jobs/123.out` would make `slurmd` truncate and write to any
+`<project>/.mcp-jobs/<alias>/123.out` would make `slurmd` truncate and write to any
 file the user owns -- a write primitive outside the containment.
 
 So the log directory is a bind with `:ro`, nested after the read-write project
@@ -113,11 +113,11 @@ the agent is concerned:
 | tool | a job the ledger does not contain |
 | --- | --- |
 | `slurm_jobs` | not listed |
-| `slurm_cancel` | refused -- `scancel` exits 0 even for ids that do not exist. The ledger is the only ownership check |
+| `slurm_cancel` | refused -- `scancel` exits 0 even for ids that do not exist, so the ledger is the only ownership check |
 | `slurm_logs` | refused, even if a file with that name exists in the log directory |
 
 That last row is deliberate: Slurm writes output by path, and a human at the
-login node could put a file at `<project>/.mcp-jobs/<id>.out` too. Serving it
+login node could put a file at `<project>/.mcp-jobs/<alias>/<id>.out` too. Serving it
 because the filename matched would make the id a capability.
 
 Status polling is served from a cache (`general.query_cache_s`, default 5 s)
@@ -128,18 +128,68 @@ Limits (`general.max_jobs`, `max_ntasks`, `max_walltime_minutes`) are enforced
 before submission. Exceeding `max_jobs` fails fast with a message rather than
 queueing more work.
 
-## Container identity
+## One instance per alias
 
-The instance name is a hash of everything that defines the containment:
-project directory, fake HOME, image (path + size + mtime, not a sha256 of a
-multi-GB SIF over Lustre), runtime binary, and the start flags. Changing the
-image, the mounts or the flags yields a new instance instead of silently
-reusing one with old mounts. `account`, `partition` and `env` are policy, not
-containment, so changing them keeps the same instance.
+```
+lumi-mcp-<alias>-<12 hex>
+```
 
-Records live in `$LUMI_MCP_STATE` (default `$HOME/.lumi-mcp`):
-`instances/<name>.json` and `locks/<name>.lock`. A record whose instance no
-longer answers is recycled on the next call.
+The alias part makes it readable and gives every alias its own container:
+its own background processes, its own `/tmp`, its own slice of the job tree.
+The hash covers everything that actually defines the containment -- project
+directory, fake HOME, image (path + size + mtime, not a sha256 of a multi-GB
+SIF over Lustre), runtime binary, start flags and the bind list. Edit
+`directory`, `image` or `home` in the config and the name changes, so the
+server starts a fresh container instead of reusing one with stale mounts.
+`account`, `partition` and `env` stay out of the hash: they are policy, not
+containment.
+
+Two aliases over the same directory, image and home (say one per allocation)
+deliberately get two containers. That costs a process and a mount namespace
+each, and buys isolation: two sessions cannot kill each other's background
+work, and each has its own job universe.
+
+A name change leaves the previous instance running, so `--stop` also sweeps
+records for the same alias under other names -- older image stamps, older
+mount sets, and the pre-alias naming scheme. Other aliases are left alone.
+
+State in `$LUMI_MCP_STATE` (default `$HOME/.lumi-mcp`):
+
+| path | what |
+| --- | --- |
+| `instances/<name>.json` | record per instance, name includes the alias |
+| `locks/<name>.lock` | `flock` for serialising start/stop |
+| `projects/<alias>/jobs.jsonl` | that alias's job ledger |
+
+The alias is also a directory name and a part of the instance name, so `.`
+and `..` are refused at config load.
+
+A record whose instance no longer answers is recycled on the next call. A
+pre-per-alias `jobs.jsonl` is split into the per-alias files on first start
+and renamed to `jobs.jsonl.migrated`, so upgrading does not orphan jobs that
+are still queued.
+
+## The job tree
+
+Everything a job produces lives inside the project, so it survives the
+session and can be read with ordinary tools:
+
+```
+<project>/.mcp-jobs/                 bound read-only into every container
+  <alias>/
+    <job id>.out                     stdout+stderr of that job
+    scripts/<job id>.sh              the batch script the server generated
+```
+
+The scripts are there for debugging: the agent can read exactly what was
+submitted, with the same paths it sees everywhere else. It cannot edit them --
+the whole `.mcp-jobs` tree is read-only in the container, and the server
+renames a script to its job id after `sbatch` has already read it.
+
+The tree covers every alias of the project, and each alias's tools only ever
+look at its own directory. Files are readable across aliases inside the
+container because the directory is one bind; the ledger, the listing and the
+log lookup are per alias.
 
 ## Probe a new host before trusting it
 
@@ -177,4 +227,12 @@ python3 tests/live_test.py user@host [/path/image.sif]   # real ssh, real apptai
 `live_test.py` pushes the server and a config to the host, speaks MCP over the
 ssh stdio stream, and checks containment, persistence, background processes,
 the read-only log directory, a real batch job end to end, cancel and teardown.
-It cleans up after itself. Current: 85 checks offline, 49 live.
+It cleans up after itself. Current: 103 checks offline, 59 live.
+
+## Not implemented
+
+- Killing a job mid-flight leaves the ledger entry as is. Stale entry reap
+  is missing.
+- Timeout handling kills the host-side `apptainer` client's process group,
+  which does not reliably kill processes started inside the container. Proper
+  cancellation needs the container-side process group.

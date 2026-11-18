@@ -14,6 +14,9 @@ general:
   max_walltime_minutes: 60    # --time ceiling
   query_cache_s: 5            # how long slurm_jobs serves a cached answer
 
+# Each alias gets its own container and its own slice of the job tree
+# (<project>/.mcp-jobs/<alias>/). Two aliases may point at the same directory
+# -- typically one per allocation -- and they will not share a container.
 projects:
   - alias: "scaling_1"
     description: "project_12345678 scaling tests set 1"

@@ -10,6 +10,7 @@ needed) and drives the server over stdio the way a harness would.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -224,6 +225,17 @@ def run(tmp: Path) -> int:
         path.write_text(body)
         path.chmod(0o755)
 
+    # a ledger from before jobs were per alias
+    legacy = [
+        {"job_id": 900, "alias": "scaling_1", "name": "old-alpha", "ntasks": 1,
+         "time_limit": "00:05:00", "command": "true", "submitted_at": 0.0,
+         "script": "/nonexistent/900.sh", "log": "/nonexistent/900.out"},
+        {"job_id": 901, "alias": "other", "name": "old-other", "ntasks": 1,
+         "time_limit": "00:05:00", "command": "true", "submitted_at": 0.0,
+         "script": "/nonexistent/901.sh", "log": "/nonexistent/901.out"},
+    ]
+    (state / "jobs.jsonl").write_text("".join(json.dumps(r) + "\n" for r in legacy))
+
     config = tmp / "config.yaml"
     config.write_text(
         f"""
@@ -243,6 +255,13 @@ projects:
     partition: "small"
     env:
       - HELLO: "{project}/hello"
+  - alias: "twin"
+    description: "same directory and image as scaling_1, different allocation"
+    directory: "{project}"
+    image: "{image}"
+    account: "project_55555555"
+    home: "{home}"
+    partition: "standard"
   - alias: "other"
     description: "second project"
     directory: "{project}/sub"
@@ -266,6 +285,26 @@ projects:
     )
     check("--status exits 0", status.returncode == 0, status.stderr)
     info = json.loads(status.stdout)
+    check("status points at the per-alias job tree",
+          info["slurm"]["log_dir"].endswith("/.mcp-jobs/scaling_1")
+          and info["slurm"]["script_dir"].endswith("/.mcp-jobs/scaling_1/scripts"),
+          str(info["slurm"]))
+
+    # the legacy ledger is split by alias the first time the server runs
+    check("legacy ledger is renamed, not left in place",
+          (state / "jobs.jsonl.migrated").exists() and not (state / "jobs.jsonl").exists(),
+          str(sorted(p.name for p in state.iterdir())))
+    migrated = {
+        alias: [json.loads(line)["job_id"]
+                for line in (state / "projects" / alias / "jobs.jsonl").read_text().splitlines()]
+        for alias in ("scaling_1", "other")
+        if (state / "projects" / alias / "jobs.jsonl").exists()
+    }
+    check("each legacy job landed in its own alias's ledger",
+          migrated == {"scaling_1": [900], "other": [901]}, str(migrated))
+    check("the migrated jobs are visible to the tools",
+          any(j["job_id"] == 900 for j in json.loads(status.stdout)["slurm"]["known_jobs"]),
+          str(json.loads(status.stdout)["slurm"]["known_jobs"]))
     check("--status resolves the alias", info["project"]["alias"] == "scaling_1")
     check("--status reports containment flags",
           "--contain" in info["runtime"]["start_flags"], str(info["runtime"]))
@@ -275,6 +314,15 @@ projects:
         [sys.executable, str(SERVER), "--config", str(config), "--project", "nope", "--status"],
         capture_output=True, text=True, env=env, cwd=str(tmp),
     )
+    badcfg = tmp / "badalias.yaml"
+    badcfg.write_text(config.read_text().replace('alias: "other"', 'alias: ".."'))
+    proc = subprocess.run(
+        [sys.executable, str(SERVER), "--config", str(badcfg), "--status"],
+        capture_output=True, text=True, env=env, cwd=str(tmp),
+    )
+    check("an alias that is a path component is refused",
+          proc.returncode != 0 and "not a usable name" in proc.stderr, proc.stderr)
+
     check("unknown alias exits non-zero", bad.returncode != 0)
     check("unknown alias names the known ones", "scaling_1" in bad.stderr, bad.stderr)
 
@@ -421,7 +469,7 @@ projects:
     check("account comes from the config", "#SBATCH --account=project_12345678" in script, script)
     check("chdir is the project", f"#SBATCH --chdir={project}" in script, script)
     check("logs land in the read-only log dir with %j",
-          f"#SBATCH --output={project}/.mcp-jobs/%j.out" in script, script)
+          f"#SBATCH --output={project}/.mcp-jobs/scaling_1/%j.out" in script, script)
     check("job name is a value, not a line", "#SBATCH --job-name=scale-run\n" in script + "\n", script)
     check("no --wrap and no --export in the script",
           "--wrap" not in script and "--export" not in script, script)
@@ -452,7 +500,20 @@ projects:
     check("second query is served from cache", "cached" in text_of(r), text_of(r))
 
     # logs
-    (project / ".mcp-jobs" / "100.out").write_text("line one\nline two\nline three\n")
+    alias_dir = project / ".mcp-jobs" / "scaling_1"
+    script_file = alias_dir / "scripts" / "100.sh"
+    check("the script is kept beside the log, named after the job",
+          script_file.is_file(), str(list((alias_dir / "scripts").iterdir())))
+    check("the kept script is the one that was submitted",
+          script_file.read_text() == script.rstrip() + "\n", script_file.read_text()[:80])
+    check("no staging file is left behind",
+          not list((alias_dir / "scripts").glob(".pending-*")),
+          str(list((alias_dir / "scripts").iterdir())))
+    check("the ledger is per alias",
+          (state / "projects" / "scaling_1" / "jobs.jsonl").is_file(),
+          str(list(state.glob("**/jobs.jsonl"))))
+
+    (alias_dir / "100.out").write_text("line one\nline two\nline three\n")
     r = h.call("slurm_logs", {"job_id": 100, "lines": 2})
     check("logs returns the requested tail",
           "line two" in text_of(r) and "line one" not in text_of(r), text_of(r))
@@ -461,7 +522,7 @@ projects:
 
     # A file with that name can exist without the job being ours. Slurm writes
     # output by path, and so could a human sitting at the login node.
-    (project / ".mcp-jobs" / "999.out").write_text("somebody else's job\n")
+    (alias_dir / "999.out").write_text("somebody else's job\n")
     r = h.call("slurm_logs", {"job_id": 999})
     check("refuses a job it did not submit, even though the file exists",
           r.get("isError") is True and "not submitted" in text_of(r), text_of(r))
@@ -489,16 +550,17 @@ projects:
         r = h.call("slurm_submit", {"name": f"fill-{n}", "command": "true"})
         check(f"submission {n + 1} of 2 is accepted", not r.get("isError"), text_of(r))
     # a job the controller no longer knows, and one that has been waiting an hour
-    ledger = state / "jobs.jsonl"
+    ledger = state / "projects" / "scaling_1" / "jobs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
     with ledger.open("a") as fh:
         fh.write(json.dumps({"job_id": 55, "alias": "scaling_1", "name": "forgotten",
                              "ntasks": 1, "time_limit": "00:05:00", "command": "true",
                              "submitted_at": time.time() - 7200,
-                             "script": "/nonexistent", "log": str(project / ".mcp-jobs" / "55.out")}) + "\n")
+                             "script": "/nonexistent", "log": str(alias_dir / "55.out")}) + "\n")
         fh.write(json.dumps({"job_id": 56, "alias": "scaling_1", "name": "waiting",
                              "ntasks": 1, "time_limit": "00:05:00", "command": "true",
                              "submitted_at": time.time() - 3600,
-                             "script": "/nonexistent", "log": str(project / ".mcp-jobs" / "56.out")}) + "\n")
+                             "script": "/nonexistent", "log": str(alias_dir / "56.out")}) + "\n")
     (logdir / "slurm" / "active-56").write_text("")
 
     # the last submit cleared the cache, so this reflects the current queue
@@ -520,6 +582,36 @@ projects:
     for path in (logdir / "slurm").glob("active-*"):
         path.unlink()
 
+    # ---- per-alias instances ---------------------------------------------
+    print("per alias")
+    st = json.loads(text_of(h.call("status", {})))
+    name = st["instance"]["name"]
+    check("instance name carries the alias", name.startswith("lumi-mcp-scaling_1-"), name)
+    check("instance name keeps a 12-hex containment hash",
+          re.fullmatch(r"lumi-mcp-scaling_1-[0-9a-f]{12}", name) is not None, name)
+    check("the job tree is per alias",
+          st["slurm"]["log_dir"] == f"{project}/.mcp-jobs/scaling_1", st["slurm"]["log_dir"])
+
+    twin = Harness(env, ["--config", str(config), "--project", "twin"])
+    twin.send("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                             "clientInfo": {"name": "smoke", "version": "0"}})
+    twin_out = text_of(twin.send("tools/call", {"name": "shell", "arguments": {"command": "echo twin"}})["result"])
+    check("the twin alias gets its own instance", "instance: started" in twin_out, twin_out)
+    twin_name = json.loads(text_of(twin.send("tools/call", {"name": "status", "arguments": {}})["result"]))["instance"]["name"]
+    check("the twin's instance name is its own", twin_name.startswith("lumi-mcp-twin-"), twin_name)
+    check("same directory, image and home, still two containers", twin_name != name, f"{name} vs {twin_name}")
+    starts = (logdir / "starts").read_text().splitlines()
+    check("both instances were started",
+          any(name in line for line in starts) and any(twin_name in line for line in starts), str(starts))
+    twin.close()
+
+    # ---- stale records are swept -----------------------------------------
+    instances = state / "instances"
+    (instances / "lumi-mcp-scaling_1-000000000000.json").write_text(
+        json.dumps({"name": "lumi-mcp-scaling_1-000000000000", "alias": "scaling_1"}))
+    (instances / f"{twin_name}.json").write_text(
+        json.dumps({"name": twin_name, "alias": "twin"}))
+
     # ---- shutdown --------------------------------------------------------
     print("shutdown")
     h.close()
@@ -530,7 +622,11 @@ projects:
         capture_output=True, text=True, env=env, cwd=str(tmp),
     )
     check("--stop exits 0", stop.returncode == 0, stop.stderr)
-    check("--stop called instance stop", (logdir / "stops").exists())
+    stops = (logdir / "stops").read_text().splitlines() if (logdir / "stops").exists() else []
+    check("--stop called instance stop", stops, str(stops))
+    check("--stop swept the old name for this alias",
+          "lumi-mcp-scaling_1-000000000000" in stops, str(stops))
+    check("--stop left the twin's instance alone", twin_name not in stops, str(stops))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

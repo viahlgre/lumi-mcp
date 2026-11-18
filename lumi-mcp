@@ -208,6 +208,10 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"{where}: alias is required")
         if not all(c.isalnum() or c in "_.-" for c in alias):
             raise ConfigError(f"{where}: alias {alias!r} may only contain letters, digits, '_', '.', '-'")
+        if alias in (".", ".."):
+            # The alias names a directory under <project>/.mcp-jobs and a part
+            # of the instance name; "." or ".." would escape both.
+            raise ConfigError(f"{where}: alias {alias!r} is not a usable name")
         if alias in seen:
             raise ConfigError(f"{where}: duplicate alias {alias!r}")
         seen.add(alias)
@@ -306,8 +310,22 @@ def select_project(config: Config, alias: str | None, cwd: Path) -> Project:
     )
 
 
-def job_log_dir(project: Project) -> Path:
+def job_log_root(project: Project) -> Path:
+    """The whole job tree for a project. Bound read-only into every container."""
     return project.directory / LOG_DIR_NAME
+
+
+def job_dir(project: Project) -> Path:
+    """This alias's slice of it: logs and the scripts that produced them."""
+    return job_log_root(project) / project.alias
+
+
+def job_script_dir(project: Project) -> Path:
+    return job_dir(project) / "scripts"
+
+
+def ledger_path(project: Project) -> Path:
+    return STATE_DIR / "projects" / project.alias / "jobs.jsonl"
 
 
 def bind_specs(project: Project) -> list[str]:
@@ -318,9 +336,12 @@ def bind_specs(project: Project) -> list[str]:
     hidden by the parent bind.
     """
     directory = str(project.directory)
-    logs = str(job_log_dir(project))
+    logs = str(job_log_root(project))
     return [
         f"{directory}:{directory}",
+        # The whole tree, not just this alias's slice: with only <alias>/ read
+        # -only, the parent would still be writable through the project bind
+        # and a session could plant a symlink in a sibling alias's namespace.
         f"{logs}:{logs}:ro",
         f"{project.home}:{host_home()}",
     ]
@@ -437,7 +458,7 @@ class Runtime:
         after the instance starts and their result is recorded and reported by
         `status`.
         """
-        logs = shlex.quote(str(job_log_dir(project)))
+        logs = shlex.quote(str(job_log_root(project)))
         script = "; ".join(
             [
                 f"test -d {shlex.quote(str(project.directory))} && echo project=ok || echo project=missing",
@@ -495,10 +516,16 @@ class Runtime:
 
 
 def instance_name(project: Project, runtime: Runtime) -> str:
-    """Deterministic name over everything that defines the containment.
+    """One instance per alias, named for the alias plus a containment hash.
 
-    account / partition / env are deliberately excluded: they are policy,
-    not containment, so changing them must not create a new container.
+    The alias makes the name readable and gives every alias its own container,
+    its own background processes and its own slice of the job tree. The hash
+    keeps the old guarantee: edit `directory`, `image`, `home` or the start
+    flags and the name changes, so the server starts a fresh container instead
+    of silently reusing one with stale mounts.
+
+    account / partition / env stay out of the hash: they are policy, not
+    containment, so changing them must not create a new container.
     """
     payload = {
         "directory": str(project.directory.resolve()),
@@ -509,7 +536,11 @@ def instance_name(project: Project, runtime: Runtime) -> str:
         "binds": bind_specs(project),
     }
     blob = json.dumps(payload, sort_keys=True).encode()
-    return "lumi-mcp-" + hashlib.sha256(blob).hexdigest()[:12]
+    digest = hashlib.sha256(blob).hexdigest()[:12]
+    # Aliases are already restricted to this charset at config load; do it
+    # again so an instance name can never carry a slash or a space.
+    alias = re.sub(r"[^A-Za-z0-9_.-]", "-", project.alias)[:32]
+    return f"lumi-mcp-{alias}-{digest}"
 
 
 @contextmanager
@@ -615,13 +646,16 @@ class Instance:
                 self.project.home.mkdir(parents=True, exist_ok=True)
             os.chmod(self.project.home, 0o700)
 
-            # The read-only log directory has to exist before the instance
-            # starts: a bind whose source is missing fails the start.
-            logs = job_log_dir(self.project)
+            # The read-only job tree has to exist before the instance starts:
+            # a bind whose source is missing fails the start. The per-alias
+            # subdirectories are created too, so the agent can see where its
+            # own logs and scripts will appear.
             try:
-                logs.mkdir(parents=True, exist_ok=True)
+                job_script_dir(self.project).mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                raise ToolError(f"cannot create log directory {logs}: {exc}") from None
+                raise ToolError(
+                    f"cannot create job directory {job_dir(self.project)}: {exc}"
+                ) from None
 
             self.runtime.instance_start(self.name, self.project)
             probe = self.runtime.probe_containment(self.name, self.project)
@@ -649,6 +683,35 @@ class Instance:
             self.record_path.unlink()
         except OSError:
             pass
+        self.stop_stale()
+
+    def stop_stale(self) -> None:
+        """Stop instances of this alias that this name no longer points at.
+
+        The name changes when the image, the directory, the fake home or the
+        flags change -- and it changed shape once, when aliases entered it.
+        Without this, those instances keep running until the node reboots and
+        nobody remembers starting them.
+        """
+        records = STATE_DIR / "instances"
+        if not records.is_dir():
+            return
+        for path in sorted(records.glob("*.json")):
+            if path.name == f"{self.name}.json":
+                continue
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if record.get("alias") != self.project.alias:
+                continue
+            name = record.get("name") or path.stem
+            log(f"stopping stale instance {name} for alias {self.project.alias}")
+            self.runtime.instance_stop(name)
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def is_alive(self) -> bool:
         return self.runtime.instance_alive(self.name)
@@ -841,7 +904,7 @@ def build_job_script(
     """
     project = server.project
     directory = str(project.directory)
-    logs = str(job_log_dir(project))
+    logs = str(job_log_root(project))
 
     container: list[str] = [
         server.runtime.command,
@@ -863,8 +926,8 @@ def build_job_script(
         f"#SBATCH --ntasks={ntasks}",
         f"#SBATCH --time={time_limit(minutes)}",
         f"#SBATCH --chdir={directory}",
-        f"#SBATCH --output={logs}/%j.out",
-        f"#SBATCH --error={logs}/%j.out",
+        f"#SBATCH --output={job_dir(project)}/%j.out",
+        f"#SBATCH --error={job_dir(project)}/%j.out",
         f"#SBATCH --comment=lumi-mcp:{project.alias}",
         "set -euo pipefail",
         "umask 077",
@@ -890,7 +953,7 @@ class Ledger:
             fh.write(json.dumps(record) + "\n")
         os.chmod(self.path, 0o600)
 
-    def entries(self, alias: str, limit: int = 20) -> list[dict[str, Any]]:
+    def entries(self, limit: int = 20) -> list[dict[str, Any]]:
         try:
             lines = self.path.read_text().splitlines()
         except FileNotFoundError:
@@ -898,21 +961,16 @@ class Ledger:
         out: list[dict[str, Any]] = []
         for line in lines:
             try:
-                record = json.loads(line)
+                out.append(json.loads(line))
             except ValueError:
                 continue
-            if record.get("alias") == alias:
-                out.append(record)
         return out[-limit:]
 
-    def has(self, alias: str, job_id: int) -> dict[str, Any] | None:
-        for record in self.entries(alias, limit=10_000):
+    def has(self, job_id: int) -> dict[str, Any] | None:
+        for record in self.entries(limit=10_000):
             if record.get("job_id") == job_id:
                 return record
         return None
-
-    def active_count(self, alias: str, live_ids: set[int]) -> int:
-        return sum(1 for r in self.entries(alias, limit=10_000) if r.get("job_id") in live_ids)
 
 
 def job_state(job_id: int) -> dict[str, str]:
@@ -952,6 +1010,53 @@ def live_states(job_ids: list[int]) -> dict[int, dict[str, str]]:
             "time_limit": limit,
         }
     return out
+
+def migrate_legacy_ledger() -> None:
+    """Split a pre-per-alias <state>/jobs.jsonl into per-alias ledgers.
+
+    Without this, an upgrade silently orphans every job submitted before it:
+    still running, no longer listed, no longer cancellable through the tools.
+    Runs once and renames the old file so it cannot happen twice.
+    """
+    old = STATE_DIR / "jobs.jsonl"
+    if not old.exists():
+        return
+    try:
+        lines = old.read_text().splitlines()
+    except OSError as exc:
+        log(f"cannot read legacy ledger {old}: {exc}")
+        return
+
+    by_alias: dict[str, list[dict[str, Any]]] = {}
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        alias = record.get("alias")
+        if isinstance(alias, str) and alias:
+            by_alias.setdefault(alias, []).append(record)
+
+    for alias, records in by_alias.items():
+        target = STATE_DIR / "projects" / alias / "jobs.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        known: set[Any] = set()
+        if target.exists():
+            for line in target.read_text().splitlines():
+                try:
+                    known.add(json.loads(line).get("job_id"))
+                except ValueError:
+                    pass
+        with target.open("a") as fh:
+            for record in records:
+                if record.get("job_id") in known:
+                    continue
+                fh.write(json.dumps(record) + "\n")
+        os.chmod(target, 0o600)
+
+    old.rename(old.with_name("jobs.jsonl.migrated"))
+    log(f"migrated {old} into {len(by_alias)} per-alias ledger(s)")
+
 
 @dataclass
 class Server:
@@ -1034,13 +1139,14 @@ def tool_status(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
         "slurm": {
             "account": server.project.account,
             "partition": server.project.partition,
-            "log_dir": str(job_log_dir(server.project)),
+            "log_dir": str(job_dir(server.project)),
+            "script_dir": str(job_script_dir(server.project)),
             "max_jobs": server.config.max_jobs,
             "max_ntasks": server.config.max_ntasks,
             "max_walltime_minutes": server.config.max_walltime_minutes,
             "known_jobs": [
                 {"job_id": r["job_id"], "name": r["name"], "submitted_at": r["submitted_at"]}
-                for r in server.ledger.entries(server.project.alias, limit=20)
+                for r in server.ledger.entries(limit=20)
             ],
         },
         "limits": {
@@ -1084,7 +1190,7 @@ def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
             f"time_minutes must be between 1 and {server.config.max_walltime_minutes}"
         )
 
-    known = [r["job_id"] for r in server.ledger.entries(server.project.alias, limit=10_000)]
+    known = [r["job_id"] for r in server.ledger.entries(limit=10_000)]
     active = live_states(known[-50:])
     if len(active) >= server.config.max_jobs:
         raise ToolError(
@@ -1096,17 +1202,20 @@ def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
         server, name=name, command=command, ntasks=ntasks, minutes=minutes
     )
 
-    scripts_dir = STATE_DIR / "scripts"
+    # The script goes next to the job's log, inside the project tree that is
+    # mounted read-only in the container: the agent can read what it
+    # submitted but cannot touch it. The name is a placeholder until sbatch
+    # hands back an id, because the id is not known before submitting.
+    scripts_dir = job_script_dir(server.project)
     scripts_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(scripts_dir, 0o700)
-    script_path = scripts_dir / f"{os.urandom(6).hex()}.sh"
-    fd = os.open(script_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    staging = scripts_dir / f".pending-{os.urandom(6).hex()}.sh"
+    fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as fh:
         fh.write(script_text)
 
     # --export=NONE: sbatch would otherwise inherit this process's
     # environment, which is the harness's, tokens and all.
-    proc = slurm("sbatch", "--parsable", "--export=NONE", str(script_path))
+    proc = slurm("sbatch", "--parsable", "--export=NONE", str(staging))
     stdout = (proc.stdout or b"").decode("utf-8", "replace").strip()
     stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
     if proc.returncode != 0:
@@ -1121,7 +1230,16 @@ def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
         raise ToolError(f"could not parse a job id from sbatch output: {stdout!r}")
 
     job_id = int(job_id_text)
-    log_path = job_log_dir(server.project) / f"{job_id}.out"
+    log_path = job_dir(server.project) / f"{job_id}.out"
+
+    # sbatch has already copied the script into its own spool, so renaming it
+    # afterwards is safe and makes <id>.sh sit beside <id>.out.
+    script_path = scripts_dir / f"{job_id}.sh"
+    try:
+        os.replace(staging, script_path)
+    except OSError as exc:
+        log(f"could not rename {staging} to {script_path}: {exc}")
+        script_path = staging
     record = {
         "job_id": job_id,
         "alias": server.project.alias,
@@ -1145,6 +1263,7 @@ def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
             f"partition: {server.project.partition}  account: {server.project.account}",
             f"ntasks: {ntasks}  time_limit: {time_limit(minutes)}",
             f"log: {log_path}",
+            f"script: {script_path}",
             "",
             "The job is queued. It runs unattended: poll with slurm_jobs and read "
             "output with slurm_logs. Cancelling is slurm_cancel.",
@@ -1157,7 +1276,7 @@ def tool_slurm_submit(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
 
 
 def _job_rows(server: Server) -> list[dict[str, Any]]:
-    entries = server.ledger.entries(server.project.alias, limit=20)
+    entries = server.ledger.entries(limit=20)
     ids = [e["job_id"] for e in entries]
     live = live_states(ids)
     rows = []
@@ -1227,7 +1346,7 @@ def tool_slurm_jobs(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
             f"{(row.get('nodes') or ''):<24} {row.get('note') or ''}"
         )
     lines.append("")
-    lines.append(f"logs: {job_log_dir(server.project)}/<job_id>.out")
+    lines.append(f"logs: {job_dir(server.project)}/<job_id>.out")
     lines.append(
         "states come from squeue/scontrol only; without a slurmdbd there is no "
         "accounting history, so old finished jobs drop out of the controller's "
@@ -1243,7 +1362,7 @@ def tool_slurm_cancel(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
     if job_id <= 0:
         raise ToolError("job_id must be a positive integer")
 
-    record = server.ledger.has(server.project.alias, job_id)
+    record = server.ledger.has(job_id)
     if record is None:
         # scancel exits 0 even for job ids that do not exist, so the ledger is
         # the only thing standing between the agent and other people's jobs.
@@ -1300,7 +1419,7 @@ def tool_slurm_logs(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
         raise ToolError("job_id must be a positive integer")
     lines_wanted = min(max(_int_arg(args, "lines", LOG_TAIL_LINES), 1), MAX_LOG_TAIL_LINES)
 
-    record = server.ledger.has(server.project.alias, job_id)
+    record = server.ledger.has(job_id)
     if record is None:
         # A file may well exist at <log dir>/<id>.out -- Slurm writes there by
         # path, and so could a human. A job this server did not submit is not
@@ -1557,7 +1676,7 @@ def handle(server: Server, msg: dict[str, Any]) -> dict[str, Any] | None:
                     host=socket.gethostname(),
                     account=server.project.account,
                     partition=server.project.partition,
-                    log_dir=job_log_dir(server.project),
+                    log_dir=job_dir(server.project),
                 ),
             },
         }
@@ -1636,6 +1755,8 @@ def main(argv: list[str] | None = None) -> int:
         log(f"error: {exc}")
         return 2
 
+    migrate_legacy_ledger()
+
     runtime_ok = os.path.isfile(config.command) and os.access(config.command, os.X_OK)
     if not runtime_ok:
         # --status is still useful for debugging a broken config, so only the
@@ -1652,7 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
         project=project,
         runtime=runtime,
         instance=Instance(runtime, project),
-        ledger=Ledger(STATE_DIR / "jobs.jsonl"),
+        ledger=Ledger(ledger_path(project)),
     )
 
     if args.status:

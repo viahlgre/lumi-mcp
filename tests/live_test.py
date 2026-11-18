@@ -100,6 +100,13 @@ projects:
     partition: "debug"
     env:
       - LIVE_MARK: "marker-set-by-config"
+  - alias: "twin"
+    description: "same directory, image and home as live, different allocation"
+    directory: "{remote['project']}"
+    image: "{image}"
+    account: "project_00000001"
+    home: "{remote['home']}"
+    partition: "debug"
 CONF
 echo pushed
 """
@@ -110,7 +117,9 @@ echo pushed
 
     # ---- request a server over ssh stdio --------------------------------
     print("mcp over ssh")
-    proc = ssh.stdin(f"python3 {remote['server']} --config {remote['config']} --project live")
+    # own state dir: the live test must not touch the real $HOME/.lumi-mcp
+    state_env = f"LUMI_MCP_STATE={base}/state"
+    proc = ssh.stdin(f"{state_env} python3 {remote['server']} --config {remote['config']} --project live")
 
     def send(method, params=None, notify=False):
         msg = {"jsonrpc": "2.0", "method": method}
@@ -196,8 +205,14 @@ echo pushed
     check("both write attempts were refused", out.count("Read-only file system") >= 2, out)
     r = call("shell", {"command": "ls -1 .mcp-jobs"})
     check("nothing was planted in the log directory", "evil" not in text_of(r), text_of(r))
-    r = call("shell", {"command": "mv .mcp-jobs /tmp/stolen 2>&1 || true"})
-    check("cannot move the log directory away", "busy" in text_of(r).lower(), text_of(r))
+    # Reading is allowed, so a cross-filesystem `mv` may well copy the tree --
+    # what must fail is removing or replacing the original.
+    r = call("shell", {"command": "mv .mcp-jobs /tmp/stolen 2>&1 || echo move-refused; "
+                                  "test -d .mcp-jobs/live && echo still-there; "
+                                  "rm -rf /tmp/stolen"})
+    out = text_of(r)
+    check("the log directory cannot be moved away",
+          "move-refused" in out and "still-there" in out, out)
 
     st = json.loads(text_of(call("status", {})))
     check("probe confirms the log dir is not writable",
@@ -235,6 +250,19 @@ echo pushed
     check("submit shows the generated script", "#SBATCH --job-name=live-probe" in out, out)
     check("script carries the project partition", "#SBATCH --partition=debug" in out, out)
 
+    script_path = f"{remote['project']}/.mcp-jobs/live/scripts/{job_id}.sh"
+    side = ssh.run(f"test -f {script_path} && sed -n '1,3p' {script_path}")
+    check("the submitted script is kept beside the log", side.returncode == 0, side.stderr)
+    check("the kept script starts with the template",
+          side.stdout.startswith("#!/bin/bash"), side.stdout)
+
+    r = call("shell", {"command": f"sed -n '1,2p' .mcp-jobs/live/scripts/{job_id}.sh; echo x > .mcp-jobs/live/scripts/hack.sh 2>&1 || true"})
+    out = text_of(r)
+    check("the agent can read the job script inside the container",
+          "#!/bin/bash" in out and "#SBATCH --job-name=live-probe" in out, out)
+    check("the agent cannot modify the job script",
+          "Read-only file system" in out, out)
+
     state, listing = wait_for_state(job_id, ("COMPLETED", "FAILED", "CANCELLED"))
     check("job reaches a terminal state", state == "COMPLETED", f"state={state}\n{listing}")
     check("job appears in slurm_jobs", str(job_id) in listing, listing)
@@ -247,7 +275,7 @@ echo pushed
     check("payload could not write into the log directory",
           "Read-only file system" in logs, logs)
 
-    log_path = f"{remote['project']}/.mcp-jobs/{job_id}.out"
+    log_path = f"{remote['project']}/.mcp-jobs/live/{job_id}.out"
     side = ssh.run(f"stat -c '%a %U %n' {log_path}")
     check("log file is in the project's log directory", ".out" in side.stdout, side.stdout)
     check("log file is owned by the user", side.returncode == 0 and " " in side.stdout, side.stdout)
@@ -257,7 +285,7 @@ echo pushed
     # jobs this server did not submit are not addressable at all
     r = call("slurm_cancel", {"job_id": 999999})
     check("refuses to cancel a foreign job id", r.get("isError") is True, text_of(r))
-    ssh.run(f"echo 'a log from a job we did not start' > {remote['project']}/.mcp-jobs/424242.out")
+    ssh.run(f"echo 'a log from a job we did not start' > {remote['project']}/.mcp-jobs/live/424242.out")
     r = call("slurm_logs", {"job_id": 424242})
     check("refuses to read a foreign job's log, file present or not",
           r.get("isError") is True and "not submitted" in text_of(r), text_of(r))
@@ -279,6 +307,36 @@ echo pushed
     state, listing = wait_for_state(sleep_id, ("CANCELLED", "COMPLETED"))
     check("cancelled job leaves the queue", state in ("CANCELLED", "COMPLETED"), listing)
 
+    # ---- a second alias over the same directory ---------------------------
+    print("twin alias")
+    twin = ssh.stdin(f"{state_env} python3 {remote['server']} --config {remote['config']} --project twin")
+    tn = [0]
+
+    def tsend(method, params=None):
+        tn[0] += 1
+        twin.stdin.write(json.dumps({"jsonrpc": "2.0", "id": tn[0], "method": method,
+                                     "params": params or {}}) + "\n")
+        twin.stdin.flush()
+        return json.loads(twin.stdout.readline())
+
+    tsend("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "twin", "version": "0"}})
+    tcall = lambda n, a: text_of(tsend("tools/call", {"name": n, "arguments": a})["result"])
+    tst = json.loads(tcall("status", {}))
+    check("the twin gets its own instance", tst["instance"]["name"].startswith("lumi-mcp-twin-"),
+          tst["instance"]["name"])
+    check("the twin has its own job tree",
+          tst["slurm"]["log_dir"].endswith(".mcp-jobs/twin"), tst["slurm"]["log_dir"])
+    check("the twin does not see the other alias's jobs",
+          str(job_id) not in tcall("slurm_jobs", {}), tcall("slurm_jobs", {}))
+    r = tcall("slurm_cancel", {"job_id": job_id})
+    check("nor can it cancel them", "not submitted" in r, r)
+    same_dir = tcall("shell", {"command": "pwd"})
+    check("both aliases see the same project directory", remote["project"].split("/")[-1] in same_dir, same_dir)
+    twin.stdin.close()
+    twin.wait(timeout=30)
+    check("twin server exits cleanly", twin.returncode == 0, f"{twin.returncode} {twin.stderr.read()[-300:]}")
+
     # ---- host side effects -----------------------------------------------
     print("host side")
     side = ssh.run(f"cat {remote['project']}/work/a.txt; echo '--'; ls -a {remote['home']} | tr '\\n' ' '")
@@ -294,10 +352,17 @@ echo pushed
 
     # ---- teardown --------------------------------------------------------
     print("teardown")
-    stop = ssh.run(f"python3 {remote['server']} --config {remote['config']} --project live --stop")
+    stop = ssh.run(f"{state_env} python3 {remote['server']} --config {remote['config']} --project live --stop")
     check("--stop works", stop.returncode == 0, stop.stderr[-300:])
-    left = ssh.run("apptainer instance list --json | grep -c lumi-mcp || true")
-    check("no lumi-mcp instance left running", left.stdout.strip() == "0", left.stdout)
+    ssh.run(f"{state_env} python3 {remote['server']} --config {remote['config']} --project twin --stop")
+    left = ssh.run(
+        "apptainer instance list --json 2>/dev/null | python3 -c \""
+        "import json,sys\n"
+        "d = json.load(sys.stdin) or {}\n"
+        "print(sum(1 for i in (d.get('instances') or []) if 'lumi-mcp' in i.get('instance','')))\""
+    )
+    check("no lumi-mcp instance left running", left.stdout.strip() == "0",
+          f"{left.stdout!r} {left.stderr[-200:]}")
     ssh.run(f"rm -rf {base}")
 
     print(f"\n{PASS} passed, {FAIL} failed")
