@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -113,7 +114,9 @@ if [ -f "$FAKE_LOG/slurm/cancelled-$id" ]; then
 elif [ -f "$FAKE_LOG/slurm/active-$id" ]; then
   echo "JobId=$id JobState=RUNNING Reason=None ExitCode=0:0 RunTime=00:00:01 NodeList=node1 WorkDir=/tmp"
 else
-  echo "JobId=$id JobState=COMPLETED Reason=None ExitCode=0:0 RunTime=00:00:05 NodeList=node1 WorkDir=/tmp"
+  # like a real controller with no slurmdbd: a finished job is forgotten
+  echo "slurm_load_jobs error: Invalid job id specified" >&2
+  exit 1
 fi
 exit 0
 """,
@@ -453,8 +456,17 @@ projects:
     r = h.call("slurm_logs", {"job_id": 100, "lines": 2})
     check("logs returns the requested tail",
           "line two" in text_of(r) and "line one" not in text_of(r), text_of(r))
+    r = h.call("slurm_logs", {"job_id": 100, "lines": 5000})
+    check("lines is clamped, not obeyed", "line three" in text_of(r), text_of(r))
+
+    # A file with that name can exist without the job being ours. Slurm writes
+    # output by path, and so could a human sitting at the login node.
+    (project / ".mcp-jobs" / "999.out").write_text("somebody else's job\n")
     r = h.call("slurm_logs", {"job_id": 999})
-    check("missing log is a clean error", r.get("isError") is True, text_of(r))
+    check("refuses a job it did not submit, even though the file exists",
+          r.get("isError") is True and "not submitted" in text_of(r), text_of(r))
+    check("that foreign log was not returned",
+          "somebody else" not in text_of(r), text_of(r))
 
     # cancel: ledger matters, because scancel exits 0 regardless
     r = h.call("slurm_cancel", {"job_id": 999})
@@ -476,6 +488,32 @@ projects:
     for n in range(2):
         r = h.call("slurm_submit", {"name": f"fill-{n}", "command": "true"})
         check(f"submission {n + 1} of 2 is accepted", not r.get("isError"), text_of(r))
+    # a job the controller no longer knows, and one that has been waiting an hour
+    ledger = state / "jobs.jsonl"
+    with ledger.open("a") as fh:
+        fh.write(json.dumps({"job_id": 55, "alias": "scaling_1", "name": "forgotten",
+                             "ntasks": 1, "time_limit": "00:05:00", "command": "true",
+                             "submitted_at": time.time() - 7200,
+                             "script": "/nonexistent", "log": str(project / ".mcp-jobs" / "55.out")}) + "\n")
+        fh.write(json.dumps({"job_id": 56, "alias": "scaling_1", "name": "waiting",
+                             "ntasks": 1, "time_limit": "00:05:00", "command": "true",
+                             "submitted_at": time.time() - 3600,
+                             "script": "/nonexistent", "log": str(project / ".mcp-jobs" / "56.out")}) + "\n")
+    (logdir / "slurm" / "active-56").write_text("")
+
+    # the last submit cleared the cache, so this reflects the current queue
+    text = text_of(h.call("slurm_jobs", {}))
+    check("a long-pending job shows its queue age", "queued 1h00m" in text, text)
+    check("pending reasons are explained, not just named",
+          "waiting for free CPUs" in text, text)
+    check("a job the controller forgot is not called UNKNOWN",
+          "finished" in text and "dropped from the controller" in text, text)
+    r = h.call("slurm_logs", {"job_id": 55})
+    check("a job that has not started has no log yet",
+          r.get("isError") is True and "when the job starts" in text_of(r), text_of(r))
+    check("no 'None' leaks into the table",
+          " None" not in text.replace("No such file", ""), text)
+
     r = h.call("slurm_submit", {"name": "one-too-many", "command": "true"})
     check("submission beyond max_jobs is refused",
           r.get("isError") is True and "max_jobs" in text_of(r), text_of(r))

@@ -781,6 +781,42 @@ def available_partitions(configured: str) -> str:
     return hint
 
 
+# Slurm's pending reasons are terse and the agent should not have to learn
+# them. Anything not listed falls through as the raw string.
+PENDING_REASONS = {
+    "Resources": "waiting for free CPUs/memory on a node",
+    "Priority": "waiting behind higher-priority jobs",
+    "PartitionNodeLimit": "this partition cannot give more nodes",
+    "PartitionTimeLimit": "requested time exceeds the partition limit",
+    "QOSMaxJobsPerUserLimit": "too many of your jobs are already queued",
+    "QOSMaxCpuPerUserLimit": "too many of your CPUs are already in use",
+    "AssocGrpCPUMinutesLimit": "the allocation's CPU-minutes are used up",
+    "AssocGrpGRESMinutesLimit": "the allocation's GPU-minutes are used up",
+    "ReqNodeNotAvail": "the node it wants is down or reserved",
+    "JobHeldUser": "held by you (scontrol hold)",
+    "JobHeldAdmin": "held by an administrator",
+    "None": "queued",
+}
+
+
+def explain_pending(reason: str) -> str:
+    if not reason:
+        return "pending"
+    hint = PENDING_REASONS.get(reason)
+    return f"{reason} ({hint})" if hint else reason
+
+
+def human_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600:02d}h"
+
+
 def time_limit(minutes: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}:00"
 
@@ -1129,20 +1165,40 @@ def _job_rows(server: Server) -> list[dict[str, Any]]:
         job_id = entry["job_id"]
         state = live.get(job_id)
         if state:
-            rows.append({**entry, **state, "source": "squeue"})
-            continue
-        info = job_state(job_id)
-        rows.append(
-            {
+            row = {**entry, **state, "source": "squeue"}
+            if row.get("reason") == "None":
+                row["reason"] = ""
+        else:
+            info = job_state(job_id)
+            row = {
                 **entry,
-                "state": info.get("JobState", "UNKNOWN"),
-                "reason": info.get("Reason", "") if info.get("Reason") != "None" else "",
+                "state": info.get("JobState", ""),
+                "reason": "" if info.get("Reason") in (None, "", "None") else info["Reason"],
                 "nodes": info.get("NodeList", ""),
                 "elapsed": info.get("RunTime", ""),
                 "exit_code": info.get("ExitCode", ""),
                 "source": "scontrol" if info else "gone",
             }
-        )
+            if not info:
+                # No slurmdbd here, so the controller forgets a job once it has
+                # finished. Our ledger is the only thing that remembers it.
+                row["state"] = "finished"
+                row["note"] = "dropped from the controller's memory; the log file is still here"
+                rows.append(row)
+                continue
+
+        if row["state"] in ("PENDING", "CONFIGURING"):
+            waited = human_duration(time.time() - row["submitted_at"])
+            row["note"] = f"{explain_pending(row['reason'])}; queued {waited}"
+            row["elapsed"] = ""
+        elif row["state"] == "CANCELLED":
+            # scancel sends SIGTERM, so 143:0 is the expected code, not news
+            row["note"] = ""
+        elif row.get("exit_code") and row["exit_code"] != "0:0":
+            row["note"] = f"exit {row['exit_code']}"
+        else:
+            row["note"] = ""
+        rows.append(row)
     return rows
 
 
@@ -1165,12 +1221,10 @@ def tool_slurm_jobs(server: Server, _args: dict[str, Any]) -> tuple[str, bool]:
     header = f"{'job':>6}  {'state':<10} {'elapsed':<8} {'name':<20} {'where':<24} note"
     lines = [header, "-" * len(header)]
     for row in rows:
-        exit_code = row.get("exit_code") or ""
-        note = f"exit {exit_code}" if exit_code and exit_code != "0:0" else (row.get("reason") or "")
         lines.append(
             f"{row['job_id']:>6}  {row['state']:<10} "
             f"{(row.get('elapsed') or ''):<8} {row['name'][:20]:<20} "
-            f"{(row.get('nodes') or ''):<24} {note}"
+            f"{(row.get('nodes') or ''):<24} {row.get('note') or ''}"
         )
     lines.append("")
     lines.append(f"logs: {job_log_dir(server.project)}/<job_id>.out")
@@ -1247,7 +1301,17 @@ def tool_slurm_logs(server: Server, args: dict[str, Any]) -> tuple[str, bool]:
     lines_wanted = min(max(_int_arg(args, "lines", LOG_TAIL_LINES), 1), MAX_LOG_TAIL_LINES)
 
     record = server.ledger.has(server.project.alias, job_id)
-    path = Path(record["log"]) if record else job_log_dir(server.project) / f"{job_id}.out"
+    if record is None:
+        # A file may well exist at <log dir>/<id>.out -- Slurm writes there by
+        # path, and so could a human. A job this server did not submit is not
+        # part of this session, so its output is not served from here.
+        raise ToolError(
+            f"job {job_id} was not submitted by this server for "
+            f"{server.project.alias!r}, so it is not part of this session. Jobs "
+            "started outside lumi-mcp are not visible through these tools; "
+            "read the file with `shell` if you need it."
+        )
+    path = Path(record["log"])
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -1381,7 +1445,9 @@ TOOLS = [
     {
         "name": "slurm_logs",
         "description": (
-            "Return the tail of a job's combined stdout/stderr. The log directory is "
+            "Return the tail of the combined stdout/stderr of a job this server "
+            "submitted (jobs started outside it are not addressable here). The "
+            "log directory is "
             "mounted read-only inside the container, so these files can be read but "
             "not written, replaced or deleted. Output is bounded; widen the tail with "
             "`lines`."

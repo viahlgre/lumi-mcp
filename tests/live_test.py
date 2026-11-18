@@ -254,9 +254,18 @@ echo pushed
     mode = side.stdout.split()[0] if side.stdout.split() else ""
     check("log file is not world-writable", not mode.endswith("2") and not mode.endswith("3") and not mode.endswith("6") and not mode.endswith("7"), side.stdout)
 
-    # cancelling something this server did not submit is refused
+    # jobs this server did not submit are not addressable at all
     r = call("slurm_cancel", {"job_id": 999999})
     check("refuses to cancel a foreign job id", r.get("isError") is True, text_of(r))
+    ssh.run(f"echo 'a log from a job we did not start' > {remote['project']}/.mcp-jobs/424242.out")
+    r = call("slurm_logs", {"job_id": 424242})
+    check("refuses to read a foreign job's log, file present or not",
+          r.get("isError") is True and "not submitted" in text_of(r), text_of(r))
+    check("that foreign log was not returned",
+          "did not start" not in text_of(r), text_of(r))
+    listing = text_of(call("slurm_jobs", {}))
+    check("jobs submitted outside the server are not listed",
+          "424242" not in listing, listing)
 
     # a long job can be cancelled
     r = call("slurm_submit", {"name": "live-sleeper", "command": "sleep 300", "time_minutes": 10})

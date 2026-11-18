@@ -88,6 +88,16 @@ symlinks. The project directory is agent-writable, so a symlink planted at
 `<project>/.mcp-jobs/123.out` would make `slurmd` truncate and write to any
 file the user owns -- a write primitive outside the containment.
 
+So the log directory is a bind with `:ro`, nested after the read-write project
+bind, in both containers (the login-node instance and the job's own
+container). Verified on Apptainer 1.5.5: inside the container the directory is
+readable, and writing, `ln -s`, `mkdir`, `rm` all fail with `Read-only file
+system`, while `mv .mcp-jobs elsewhere` fails with `Device or resource busy`
+(it is a mount point, so it cannot be swapped out from under the bind). From
+the host -- and therefore from `slurmd` -- the directory stays writable. The
+containment probe checks this on every start and refuses to hand out an
+instance whose log directory is writable inside.
+
 The agent can read its own logs, just not influence where they go or delete
 them afterwards. One caveat: `slurmd` creates the file itself, with mode 0644
 regardless of the script's `umask` -- the directory is 0755, so treat job
@@ -95,11 +105,24 @@ output as readable by the project group.
 
 ### Which jobs the server will touch
 
-`cancel` is scoped to the ledger, never to the id alone: `scancel` exits 0 even
-for job ids that do not exist, so a return code proves nothing. Ids that this
-server did not submit for this alias are refused. Status polling is served
-from a cache (`general.query_cache_s`, default 5 s) so an agent can poll
-without thinking about rates; the response says how old it is.
+The server deals only with jobs which exists in the ledger and queries are
+targeted: `squeue -j <ledger ids>`, so a job submitted at the login node by
+hand, or by an older session whose ledger is gone, is not visible as far as
+the agent is concerned:
+
+| tool | a job the ledger does not contain |
+| --- | --- |
+| `slurm_jobs` | not listed |
+| `slurm_cancel` | refused -- `scancel` exits 0 even for ids that do not exist. The ledger is the only ownership check |
+| `slurm_logs` | refused, even if a file with that name exists in the log directory |
+
+That last row is deliberate: Slurm writes output by path, and a human at the
+login node could put a file at `<project>/.mcp-jobs/<id>.out` too. Serving it
+because the filename matched would make the id a capability.
+
+Status polling is served from a cache (`general.query_cache_s`, default 5 s)
+so an agent can poll without thinking about rates; the response says how old
+it is.
 
 Limits (`general.max_jobs`, `max_ntasks`, `max_walltime_minutes`) are enforced
 before submission. Exceeding `max_jobs` fails fast with a message rather than
@@ -154,5 +177,4 @@ python3 tests/live_test.py user@host [/path/image.sif]   # real ssh, real apptai
 `live_test.py` pushes the server and a config to the host, speaks MCP over the
 ssh stdio stream, and checks containment, persistence, background processes,
 the read-only log directory, a real batch job end to end, cancel and teardown.
-It cleans up after itself. Current: 78 checks offline, 46 live.
-
+It cleans up after itself. Current: 85 checks offline, 49 live.
